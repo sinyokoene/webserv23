@@ -1,8 +1,8 @@
 #ifndef HTTPRESPONSE_HPP
 #define HTTPRESPONSE_HPP
 
-#include <string>
 #include <map>
+#include <string>
 
 class HttpResponse {
 public:

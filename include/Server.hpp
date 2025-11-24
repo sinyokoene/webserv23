@@ -1,15 +1,17 @@
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
+#include <sys/select.h> // For fd_set
+#include <ctime>        // For time_t
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
-#include <set>
+
 #include "ConfigParser.hpp"
 #include "HttpRequest.hpp"
 #include "HttpResponse.hpp"
-#include <sys/select.h> // For fd_set
-#include <map>          // For clientBuffers
-#include <ctime>        // For time_t
+#include "LocationConfig.hpp"
 
 class Server {
 public:

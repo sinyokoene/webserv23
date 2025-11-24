@@ -1,9 +1,10 @@
 #ifndef CONFIGPARSER_HPP
 #define CONFIGPARSER_HPP
 
-#include <string>
 #include <map>
+#include <string>
 #include <vector>
+
 #include "LocationConfig.hpp"
 
 class ConfigParser {

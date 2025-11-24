@@ -1,8 +1,8 @@
 #ifndef HTTPREQUEST_HPP
 #define HTTPREQUEST_HPP
 
-#include <string>
 #include <map>
+#include <string>
 
 class HttpRequest {
 public:
