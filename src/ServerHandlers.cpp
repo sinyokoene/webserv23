@@ -1,15 +1,4 @@
 #include "Server.hpp"
-#include <sys/stat.h>
-#include <dirent.h>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <unistd.h>
-#include <cctype>
-#include <ctime>
-#include <iostream> // Added for std::cerr
-#include <cstring>  // Added for strerror
-#include <cstdio>   // Added for remove (though unistd.h might also provide it)
 
 // Helpers
 static inline std::string toLowerAscii(const std::string& s) {

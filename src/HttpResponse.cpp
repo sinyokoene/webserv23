@@ -1,5 +1,4 @@
 #include "HttpResponse.hpp"
-#include <sstream>
 
 HttpResponse::HttpResponse() : statusCode(200), body("") {}
 

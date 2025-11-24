@@ -1,32 +1,4 @@
 #include "Server.hpp"
-#include "HttpRequest.hpp"
-#include "HttpResponse.hpp"
-#include "ConfigParser.hpp"
-#include "ServerCgiHandler.hpp"
-#include "ServerHandlers.hpp"
-
-#include <iostream>
-#include <string>
-#include <vector>
-#include <sstream>
-#include <fstream>
-#include <set>
-#include <map>
-#include <algorithm>
-#include <limits.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <sys/wait.h>
-#include <cstdio>
-#include <cerrno>
-#include <cstring>
-#include <stdlib.h>
-
 
 Server::Server(const std::string& configFile) {
     configPath = configFile;

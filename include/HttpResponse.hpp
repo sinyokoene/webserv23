@@ -2,6 +2,7 @@
 #define HTTPRESPONSE_HPP
 
 #include <map>
+#include <sstream>
 #include <string>
 
 class HttpResponse {

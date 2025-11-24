@@ -1,10 +1,28 @@
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
+#include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
 #include <sys/select.h> // For fd_set
-#include <ctime>        // For time_t
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime> // For time_t
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 

@@ -1,16 +1,4 @@
 #include "Server.hpp"
-#include <iostream>
-#include <string>
-#include <vector>
-#include <map>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <cstdlib> // For setenv, unsetenv
-#include <cstring> // For strdup
-#include <sstream> // For stringstream
-#include <sys/stat.h> // Added for stat, S_ISREG
-#include <cerrno>   // Added for errno
-#include <fcntl.h>  // For fcntl, O_NONBLOCK
 
 // Current CGI handler uses blocking pipes and waitpid. For full compliance,
 // consider refactoring to integrate pipe FDs into the main select() loop with

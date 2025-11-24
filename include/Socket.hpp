@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 

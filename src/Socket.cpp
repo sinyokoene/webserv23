@@ -1,9 +1,4 @@
 #include "Socket.hpp"
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <stdexcept>
-#include <cstring>
 
 Socket::Socket(int domain, int type, int protocol) {
     sockfd = socket(domain, type, protocol);

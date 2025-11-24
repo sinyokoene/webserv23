@@ -1,6 +1,9 @@
 #ifndef UTILS_HPP
 #define UTILS_HPP
 
+#include <algorithm>
+#include <cctype>
+#include <sstream>
 #include <string>
 #include <vector>
 
