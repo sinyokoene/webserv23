@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload Tester</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <header>
+        <h1>Upload Tester</h1>
+        <nav><a href="/">Home</a></nav>
+    </header>
+    <main>
+        <section>
+            <h2>POST multipart/form-data to /uploads</h2>
+            <form id="form-multipart" action="/uploads" method="POST" enctype="multipart/form-data">
+                <input type="file" name="file" required>
+                <button type="submit">Upload</button>
+            </form>
+            <p id="result-multipart" class="result"></p>
+        </section>
+
+        <section>
+            <h2>POST raw/binary to /uploads</h2>
+            <input id="file-post" type="file" />
+            <button id="btn-post">POST to /uploads</button>
+            <pre id="result-post" class="result"></pre>
+        </section>
+
+        <section>
+            <h2>PUT raw/binary to /put_test/&lt;filename&gt;</h2>
+            <input id="file-put" type="file" />
+            <input id="put-name" type="text" placeholder="filename (optional)">
+            <button id="btn-put">PUT to /put_test</button>
+            <pre id="result-put" class="result"></pre>
+        </section>
+        <section>
+            <h2>Manage uploaded files (DELETE)</h2>
+            <div>
+                <h3>/uploads</h3>
+                <button id="refresh-uploads">Refresh</button>
+                <ul id="list-uploads"></ul>
+            </div>
+            <div style="margin-top: 1rem;">
+                <h3>/uploads_put</h3>
+                <button id="refresh-uploads-put">Refresh</button>
+                <ul id="list-uploads-put"></ul>
+            </div>
+            <pre id="result-delete" class="result"></pre>
+        </section>
+    </main>
+
+    <script>
+    // helper to POST/PUT binary body
+    async function sendBinary(method, url, file) {
+        const res = await fetch(url, {
+            method: method,
+            headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': file.name },
+            body: file
+        });
+        const text = await res.text();
+        return { status: res.status, text };
+    }
+
+    // POST multipart result handler (server ignores multipart but should still accept body)
+    document.getElementById('form-multipart').addEventListener('submit', function(e) {
+        const el = document.getElementById('result-multipart');
+        el.textContent = 'Uploading...';
+        // Let the browser submit; response will render as a new page. Also mirror via fetch to show status inline.
+        e.preventDefault();
+        const form = e.target;
+        fetch(form.action, { method: 'POST', body: new FormData(form) })
+            .then(async (r) => ({ status: r.status, text: await r.text() }))
+            .then(({ status, text }) => { el.textContent = 'Status ' + status + '\n' + text; })
+            .catch(err => { el.textContent = 'Error: ' + err; });
+    });
+
+    document.getElementById('btn-post').addEventListener('click', async () => {
+        const input = document.getElementById('file-post');
+        const resEl = document.getElementById('result-post');
+        if (!input.files || !input.files[0]) { resEl.textContent = 'Pick a file first.'; return; }
+        resEl.textContent = 'Uploading...';
+        try {
+            const { status, text } = await sendBinary('POST', '/uploads', input.files[0]);
+            resEl.textContent = 'Status ' + status + '\n' + text;
+        } catch (e) {
+            resEl.textContent = 'Error: ' + e;
+        }
+    });
+
+    document.getElementById('btn-put').addEventListener('click', async () => {
+        const input = document.getElementById('file-put');
+        const nameInput = document.getElementById('put-name');
+        const resEl = document.getElementById('result-put');
+        if (!input.files || !input.files[0]) { resEl.textContent = 'Pick a file first.'; return; }
+        const name = nameInput.value.trim() || encodeURIComponent(input.files[0].name);
+        const url = '/put_test/' + name;
+        resEl.textContent = 'Uploading...';
+        try {
+            const { status, text } = await sendBinary('PUT', url, input.files[0]);
+            resEl.textContent = 'Status ' + status + '\n' + text;
+        } catch (e) {
+            resEl.textContent = 'Error: ' + e;
+        }
+    });
+
+    // ---- Directory listing + DELETE helpers ----
+    function joinPath(base, rel) {
+        if (base.endsWith('/')) base = base.slice(0, -1);
+        return base + '/' + rel.replace(/^\//, '');
+    }
+
+    async function fetchDirectoryEntries(path) {
+        // Expecting autoindex HTML; parse anchor tags
+        try {
+            async function parseListing(resp, usedPath) {
+                if (!resp.ok) {
+                    const dbg = document.getElementById('result-delete');
+                    if (dbg) dbg.textContent = 'List ' + usedPath + ' -> Status ' + resp.status;
+                    return [];
+                }
+                const html = await resp.text();
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const list = doc.querySelector('ul') || doc.body;
+                const anchors = Array.from(list.querySelectorAll('a'));
+                const entries = [];
+                for (const a of anchors) {
+                    const text = (a.textContent || '').trim();
+                    const href = (a.getAttribute('href') || '').trim();
+                    if (!href || text.toLowerCase().includes('parent')) continue;
+                    const absoluteUrl = (href.startsWith('http') || href.startsWith('/')) ? href : joinPath(usedPath, href);
+                    try {
+                        const u = new URL(absoluteUrl, window.location.origin);
+                        if (!u.pathname.startsWith(usedPath)) continue;
+                    } catch (_) {}
+                    entries.push({ name: text || href, url: absoluteUrl });
+                }
+                return entries;
+            }
+
+            // Try with given path first
+            const res = await fetch(path, { method: 'GET' });
+            let entries = await parseListing(res, path);
+            if (entries.length === 0) {
+                // Fallback: toggle trailing slash
+                const altPath = path.endsWith('/') ? path.slice(0, -1) : (path + '/');
+                const res2 = await fetch(altPath, { method: 'GET' });
+                const altEntries = await parseListing(res2, altPath);
+                if (altEntries.length > 0) entries = altEntries;
+            }
+            return entries;
+        } catch (_) {
+            return [];
+        }
+    }
+
+    async function handleDelete(url, liEl, resultEl) {
+        if (!confirm('Delete ' + url + ' ?')) return;
+        resultEl.textContent = 'Deleting ' + url + '...';
+        try {
+            const res = await fetch(url, { method: 'DELETE' });
+            const body = await res.text();
+            if (res.ok) {
+                if (liEl && liEl.parentNode) liEl.parentNode.removeChild(liEl);
+                resultEl.textContent = 'Deleted. Status ' + res.status;
+            } else {
+                resultEl.textContent = 'Failed (Status ' + res.status + '): ' + body;
+            }
+        } catch (e) {
+            resultEl.textContent = 'Error: ' + e;
+        }
+    }
+
+    async function renderDirectory(path, listId) {
+        const list = document.getElementById(listId);
+        const resultEl = document.getElementById('result-delete');
+        list.innerHTML = '';
+        const items = await fetchDirectoryEntries(path);
+        if (!items.length) {
+            const li = document.createElement('li');
+            li.textContent = '(no files or autoindex disabled)';
+            list.appendChild(li);
+            return;
+        }
+        for (const item of items) {
+            const li = document.createElement('li');
+            const nameSpan = document.createElement('span');
+            nameSpan.textContent = item.name + ' ';
+            const link = document.createElement('a');
+            link.href = item.url;
+            link.textContent = '(open)';
+            link.style.marginRight = '0.5rem';
+            const btn = document.createElement('button');
+            btn.textContent = 'Delete';
+            btn.addEventListener('click', () => handleDelete(item.url, li, resultEl));
+            li.appendChild(nameSpan);
+            li.appendChild(link);
+            li.appendChild(btn);
+            list.appendChild(li);
+        }
+    }
+
+    // Wire up refresh buttons and initial load
+    document.getElementById('refresh-uploads').addEventListener('click', () => renderDirectory('/uploads/', 'list-uploads'));
+    document.getElementById('refresh-uploads-put').addEventListener('click', () => renderDirectory('/uploads_put/', 'list-uploads-put'));
+    window.addEventListener('DOMContentLoaded', () => {
+        renderDirectory('/uploads/', 'list-uploads');
+        renderDirectory('/uploads_put/', 'list-uploads-put');
+    });
+    </script>
+</body>
+</html>
+
+

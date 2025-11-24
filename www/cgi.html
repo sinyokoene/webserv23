@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CGI Demo</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .card { margin-top: 20px; padding: 20px; background: #fff; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .row { margin-bottom: 16px; }
+        input[type="text"], textarea { width: 100%; max-width: 600px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 8px 14px; border: 0; border-radius: 4px; background: #007bff; color: #fff; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        code { background: #f0f0f0; padding: 2px 4px; border-radius: 3px; }
+    </style>
+    
+</head>
+<body>
+    <header>
+        <h1>CGI Demo</h1>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>GET to CGI script</h2>
+            <p>
+                This link calls the shell CGI script under <code>/cgi-bin/</code>.
+            </p>
+            <p>
+                <a href="/cgi-bin/test.sh">GET /cgi-bin/test.sh</a>
+            </p>
+        </section>
+
+        <section class="card">
+            <h2>POST to CGI script</h2>
+            <p>Submit a POST to <code>/cgi-bin/test.sh</code> with a small body.</p>
+            <form action="/cgi-bin/test.sh" method="post">
+                <div class="row">
+                    <textarea name="data" rows="4" placeholder="Type something…">Hello from CGI POST</textarea>
+                </div>
+                <button type="submit">POST to /cgi-bin/test.sh</button>
+            </form>
+        </section>
+
+        <section class="card">
+            <h2>Ubuntu tester: .bla CGI</h2>
+            <p>Posts to a <code>.bla</code> endpoint which is handled by the Ubuntu CGI tester binary.</p>
+            <form action="/test.bla" method="post">
+                <div class="row">
+                    <input type="text" name="msg" value="ubuntu tester CGI">
+                </div>
+                <button type="submit">POST to /test.bla</button>
+            </form>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2023 WebServ. All rights reserved.</p>
+    </footer>
+</body>
+</html>
+
+
