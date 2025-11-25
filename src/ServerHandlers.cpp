@@ -67,7 +67,7 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
     }
 
     // Los het bestandspad op
-    std::string resolvedPath = resolvePath(effectiveRoot, request.getPath());
+    std::string resolvedPath = resolvePath(config, effectiveRoot, request.getPath());
     if (resolvedPath.empty()) {
         response.setStatus(403); // Verboden
         serveErrorPage(response, 403, config);
@@ -93,10 +93,10 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
             indexFiles.push_back("index.html");  // Standaard fallback
         }
 
-        std::string indexPath;
-        for (size_t i = 0; i < indexFiles.size(); ++i) {
-            std::string testPath = resolvePath(resolvedPath, indexFiles[i]);
-            if (!testPath.empty() && stat(testPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+    std::string indexPath;
+    for (size_t i = 0; i < indexFiles.size(); ++i) {
+        std::string testPath = resolvePath(config, resolvedPath, indexFiles[i]);
+        if (!testPath.empty() && stat(testPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
                 indexPath = testPath;
                 break;
             }
@@ -191,7 +191,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
         // Resolve upload directory relative to effectiveRoot even if upload_store starts with '/'
         std::string uploadStore = locConfig.getUploadStore();
         if (!uploadStore.empty() && uploadStore[0] == '/') uploadStore = uploadStore.substr(1);
-        std::string uploadDir = resolvePath(effectiveRoot, uploadStore);
+        std::string uploadDir = resolvePath(config, effectiveRoot, uploadStore);
         if (uploadDir.empty()) {
             response.setStatus(500); // Internal Server Error
             serveErrorPage(response, 500, config);
@@ -275,7 +275,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
 
                     if (!filename.empty()) {
                         savedFilename = filename;
-                        fullPath = resolvePath(uploadDir, savedFilename);
+                        fullPath = resolvePath(config, uploadDir, savedFilename);
                         if (fullPath.empty()) break;
                         std::ofstream outFile(fullPath.c_str(), std::ios::binary);
                         if (!outFile.is_open()) { fullPath.clear(); break; }
@@ -311,7 +311,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
             } else {
                 savedFilename = suggestedFilename;
             }
-            fullPath = resolvePath(uploadDir, savedFilename);
+            fullPath = resolvePath(config, uploadDir, savedFilename);
             if (fullPath.empty()) {
                 response.setStatus(500);
                 serveErrorPage(response, 500, config);
@@ -347,7 +347,7 @@ void Server::handleDeleteRequest(HttpRequest& request, HttpResponse& response,
                                const LocationConfig& /*locConfig*/, // Marked as unused
                                const std::string& effectiveRoot) {
     // Los het te verwijderen bestand op
-    std::string resolvedPath = resolvePath(effectiveRoot, request.getPath());
+    std::string resolvedPath = resolvePath(config, effectiveRoot, request.getPath());
     if (resolvedPath.empty()) {
         response.setStatus(403); // Verboden
         serveErrorPage(response, 403, config);
@@ -426,7 +426,7 @@ void Server::handlePutRequest(HttpRequest& request, HttpResponse& response,
     } else {
         std::string uploadStore = locConfig.getUploadStore();
         if (!uploadStore.empty() && uploadStore[0] == '/') uploadStore = uploadStore.substr(1);
-        targetDir = resolvePath(effectiveRoot, uploadStore);
+        targetDir = resolvePath(config, effectiveRoot, uploadStore);
     }
     if (targetDir.empty()) {
         response.setStatus(500);
@@ -464,21 +464,21 @@ void Server::handlePutRequest(HttpRequest& request, HttpResponse& response,
         // No name provided in URL; use suggested or generate
         std::string nameToUse = suggestedFilename;
         if (nameToUse.empty()) { std::ostringstream oss; oss << "put_" << time(NULL); nameToUse = oss.str(); }
-        finalPath = resolvePath(targetDir, nameToUse);
+        finalPath = resolvePath(config, targetDir, nameToUse);
     } else {
         // If subpath looks like a directory (no dot in last segment), and we have a suggested filename, store inside that directory
         size_t lastSlash = relativeSubpath.find_last_of('/');
         std::string lastSegment = (lastSlash == std::string::npos) ? relativeSubpath : relativeSubpath.substr(lastSlash + 1);
         bool treatAsDirectory = (lastSegment.find('.') == std::string::npos) && !suggestedFilename.empty();
         if (treatAsDirectory) {
-            std::string dirResolved = resolvePath(targetDir, relativeSubpath);
+            std::string dirResolved = resolvePath(config, targetDir, relativeSubpath);
             if (dirResolved.empty()) { response.setStatus(403); serveErrorPage(response, 403, config); return; }
             // Create directory path if needed
             if (!createDirectoriesRecursively(dirResolved)) { response.setStatus(500); serveErrorPage(response, 500, config); return; }
-            finalPath = resolvePath(dirResolved, suggestedFilename);
+            finalPath = resolvePath(config, dirResolved, suggestedFilename);
         } else {
             // Treat as explicit filename (may include nested directories)
-            finalPath = resolvePath(targetDir, relativeSubpath);
+            finalPath = resolvePath(config, targetDir, relativeSubpath);
             if (finalPath.empty()) { response.setStatus(403); serveErrorPage(response, 403, config); return; }
             // Ensure parent directories exist
             size_t ps = finalPath.find_last_of('/');
@@ -497,7 +497,7 @@ void Server::handlePutRequest(HttpRequest& request, HttpResponse& response,
     }
 
     // Enforce max body size
-    if (currentConfig.clientMaxBodySize > 0 && (long)request.getBody().size() > currentConfig.clientMaxBodySize) {
+    if (config.clientMaxBodySize > 0 && (long)request.getBody().size() > config.clientMaxBodySize) {
         response.setStatus(413);
         serveErrorPage(response, 413, config);
         return;

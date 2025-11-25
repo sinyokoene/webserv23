@@ -40,7 +40,7 @@ public:
 private:
     void parseConfig(const std::string& configFile);
     const LocationConfig& findLocationConfig(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const;
-    std::string resolvePath(const std::string& basePath, const std::string& relativePath) const;
+    std::string resolvePath(const ConfigParser::ServerConfig& config, const std::string& basePath, const std::string& relativePath) const;
     void serveErrorPage(HttpResponse& response, int statusCode, const ConfigParser::ServerConfig& config);
     std::set<std::string> getAllowedMethodsForPath(const std::string& path, const ConfigParser::ServerConfig& config) const;
 
@@ -75,11 +75,19 @@ private:
                           
     // Utility
     std::string getMimeType(const std::string& path) const;
+    
+    // Config selection
+    const ConfigParser::ServerConfig& selectConfig(int port, const std::string& hostHeader) const;
 
     std::string configPath;
     std::vector<ConfigParser::ServerConfig> serverConfigs;
-    ConfigParser::ServerConfig currentConfig; // For simplicity, using first config or currently matched one
+    ConfigParser::ServerConfig currentConfig; // Fallback
     std::vector<int> serverSockets;
+    
+    // Mapping from port to list of configs (for multi-port/host support)
+    std::map<int, std::vector<const ConfigParser::ServerConfig*> > portToConfigs;
+    // Mapping from server socket fd to port
+    std::map<int, int> socketPortMap;
 };
 
 #endif // SERVER_HPP

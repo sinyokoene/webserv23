@@ -1,4 +1,5 @@
 #include "Server.hpp"
+#include "Utils.hpp"
 
 Server::Server(const std::string& configFile) {
     configPath = configFile;
@@ -70,7 +71,7 @@ const LocationConfig& Server::findLocationConfig(const ConfigParser::ServerConfi
 }
 
 
-std::string Server::resolvePath(const std::string& basePath, const std::string& relativePath) const {
+std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const std::string& basePath, const std::string& relativePath) const {
     if (relativePath.find("..") != std::string::npos) {
         return "";
     }
@@ -85,8 +86,8 @@ std::string Server::resolvePath(const std::string& basePath, const std::string& 
     if (!relativePath.empty() && relativePath[0] == '/') {
         
         std::string bestMatchPath = "";
-        const LocationConfig* bestMatchConfig = &currentConfig.defaultLocationSettings;
-        for (std::map<std::string, LocationConfig>::const_iterator it = currentConfig.locations.begin(); it != currentConfig.locations.end(); ++it) {
+        const LocationConfig* bestMatchConfig = &config.defaultLocationSettings;
+        for (std::map<std::string, LocationConfig>::const_iterator it = config.locations.begin(); it != config.locations.end(); ++it) {
             const std::string& locationPath = it->first;
             bool matches = false;
             if (relativePath.find(locationPath) == 0) {
@@ -105,36 +106,17 @@ std::string Server::resolvePath(const std::string& basePath, const std::string& 
         }
         
         if (!bestMatchPath.empty()) {
-            char locRootReal[PATH_MAX];
-            std::string locRoot = bestMatchConfig->getRoot().empty() ? currentConfig.root : bestMatchConfig->getRoot();
-            if (realpath(locRoot.c_str(), locRootReal) == NULL) {
-                strncpy(locRootReal, locRoot.c_str(), sizeof(locRootReal)-1);
-                locRootReal[sizeof(locRootReal)-1] = '\0';
-            }
-            if (std::string(locRootReal) == canonicalBasePath) {
-                
-                if (!bestMatchPath.empty() && bestMatchPath[bestMatchPath.size()-1] == '/') {
-                    std::string withoutSlash = bestMatchPath.substr(0, bestMatchPath.size()-1);
-                    if (relativePath == withoutSlash) {
-                        joinPath = ""; 
-                    } else if (relativePath.find(bestMatchPath) == 0) {
-                        joinPath = relativePath.substr(bestMatchPath.length());
-                        if (!joinPath.empty() && joinPath[0] == '/') joinPath = joinPath.substr(1);
-                    } else if (relativePath.find(withoutSlash) == 0) {
-                        
-                        joinPath = relativePath.substr(withoutSlash.length());
-                        if (!joinPath.empty() && joinPath[0] == '/') joinPath = joinPath.substr(1);
-                    } else {
-                        joinPath = (relativePath.size() > 0 && relativePath[0] == '/') ? relativePath.substr(1) : relativePath;
-                    }
-                } else {
-                    joinPath = (relativePath.size() > 0 && relativePath[0] == '/') ? relativePath.substr(1) : relativePath;
+            if (!bestMatchConfig->getRoot().empty()) {
+                canonicalBasePath = bestMatchConfig->getRoot();
+                char realRoot[PATH_MAX];
+                if (realpath(canonicalBasePath.c_str(), realRoot) != NULL) {
+                   canonicalBasePath = std::string(realRoot);
                 }
-            } else {
-                joinPath = (relativePath.size() > 0) ? relativePath.substr(1) : relativePath;
+                
+                std::string sub = relativePath.substr(bestMatchPath.length());
+                while (!sub.empty() && sub[0] == '/') sub = sub.substr(1);
+                joinPath = sub;
             }
-        } else {
-            joinPath = (relativePath.size() > 0) ? relativePath.substr(1) : relativePath;
         }
     }
 
@@ -165,7 +147,7 @@ void Server::serveErrorPage(HttpResponse& response, int statusCode, const Config
     std::map<int, std::string>::const_iterator it = config.errorPages.find(statusCode);
     std::string errorPagePath;
     if (it != config.errorPages.end()) {
-        errorPagePath = resolvePath(config.root, it->second);
+        errorPagePath = resolvePath(config, config.root, it->second);
     }
     if (!errorPagePath.empty()) {
         std::ifstream errFile(errorPagePath.c_str());
@@ -199,6 +181,38 @@ std::set<std::string> Server::getAllowedMethodsForPath(const std::string& path, 
     return defaultMethods;
 }
 
+const ConfigParser::ServerConfig& Server::selectConfig(int port, const std::string& hostHeader) const {
+    std::map<int, std::vector<const ConfigParser::ServerConfig*> >::const_iterator it = portToConfigs.find(port);
+    if (it == portToConfigs.end() || it->second.empty()) {
+        return currentConfig; 
+    }
+    
+    const std::vector<const ConfigParser::ServerConfig*>& configs = it->second;
+    
+    // Extract hostname from hostHeader (remove port if present)
+    std::string hostname = hostHeader;
+    size_t colon = hostname.find(':');
+    if (colon != std::string::npos) {
+        hostname = hostname.substr(0, colon);
+    }
+    
+    // RFC 7230 2.7.1: Host header is case-insensitive
+    hostname = toLower(hostname);
+
+    // 1. Match server_name
+    for (size_t i = 0; i < configs.size(); ++i) {
+        // serverName should also be compared case-insensitively, assuming it was parsed/stored as is.
+        // However, conventions usually have it lowercase. To be safe, let's assume serverName might be mixed case too or just compare against lowercased version.
+        // Better: compare lowercased serverName.
+        if (toLower(configs[i]->serverName) == hostname) {
+             return *configs[i];
+        }
+    }
+    
+    // 2. Default to the first one for this port
+    return *configs[0];
+}
+
 void Server::start() {
     try {
         std::ofstream logFile("server.log");
@@ -206,13 +220,39 @@ void Server::start() {
             logFile << "Attempting to start server with config: " << configPath << std::endl;
         }
 
-        for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
-            it != currentConfig.listenPorts.end(); ++it) {
-            int port = atoi(it->c_str());
-            if (port <= 0 || port > 65535) {
-                std::cerr << "Invalid port: " << *it << ". Skipping." << std::endl;
-                continue;
+        // 1. Populate portToConfigs map and identify unique ports
+        std::set<int> portsToBind;
+        portToConfigs.clear();
+
+        if (serverConfigs.empty()) {
+            // Fallback to currentConfig (emergency default) if no configs parsed
+            for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
+                 it != currentConfig.listenPorts.end(); ++it) {
+                 int port = atoi(it->c_str());
+                 if (port > 0 && port <= 65535) {
+                     portsToBind.insert(port);
+                     portToConfigs[port].push_back(&currentConfig);
+                 }
             }
+        } else {
+            for (size_t i = 0; i < serverConfigs.size(); ++i) {
+                for (std::vector<std::string>::const_iterator it = serverConfigs[i].listenPorts.begin();
+                     it != serverConfigs[i].listenPorts.end(); ++it) {
+                    int port = atoi(it->c_str());
+                    if (port > 0 && port <= 65535) {
+                        portsToBind.insert(port);
+                        portToConfigs[port].push_back(&serverConfigs[i]);
+                    }
+                }
+            }
+        }
+
+        // 2. Bind sockets
+        socketPortMap.clear();
+        serverSockets.clear();
+
+        for (std::set<int>::iterator it = portsToBind.begin(); it != portsToBind.end(); ++it) {
+            int port = *it;
 
             int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
             if (serverSocket < 0) {
@@ -220,7 +260,6 @@ void Server::start() {
                 continue;
             }
 
-            
             int flags = fcntl(serverSocket, F_GETFL, 0);
             if (flags != -1) fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
 
@@ -250,6 +289,8 @@ void Server::start() {
             }
 
             serverSockets.push_back(serverSocket);
+            socketPortMap[serverSocket] = port;
+
             if (logFile.is_open()) {
                 logFile << "Server is listening on port " << port << std::endl;
             }
@@ -287,6 +328,7 @@ void Server::start() {
         std::map<int, std::string> chunkedNewHeaders; 
         std::map<int, bool> chunkedComplete;          
         std::map<int, size_t> chunkedConsumedEnd;     
+        std::map<int, int> clientPortMap; // Map client fd to server port
 
         std::cout << "Server is running. Press Ctrl+C to stop." << std::endl;
 
@@ -329,6 +371,7 @@ void Server::start() {
                     chunkedNewHeaders.erase(fd);
                     chunkedComplete.erase(fd);
                     chunkedConsumedEnd.erase(fd);
+                    clientPortMap.erase(fd);
                     lastActivity.erase(it++); 
                 } else {
                     ++it;
@@ -363,6 +406,9 @@ void Server::start() {
                             keepAliveMap[clientSocket] = false;
                             lastActivity[clientSocket] = now;
                             sentContinueMap[clientSocket] = false;
+                            
+                            // Record which port this client connected to
+                            clientPortMap[clientSocket] = socketPortMap[i];
                         }
                         continue;
                     }
@@ -373,8 +419,13 @@ void Server::start() {
                         if (bytesRead > 0) {
                             clientBuffers[i].append(buffer, bytesRead);
                             lastActivity[i] = now;
+                            
+                            // Select config early for error page checks
+                            int port = clientPortMap[i];
+                            const ConfigParser::ServerConfig& tempConfig = selectConfig(port, ""); // Default to first config for port
+
                             if (clientBuffers[i].size() > MAX_REQUEST_BYTES) {
-                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, currentConfig); resp.setHeader("Connection", "close");
+                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, tempConfig); resp.setHeader("Connection", "close");
                                 keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
                                 clientBuffers[i].clear();
                                 goto next_fd;
@@ -389,6 +440,8 @@ void Server::start() {
                                 bool expectContinue = false; 
                                 size_t consumedEndForErase = 0; 
                                 std::string normalizedRequestForParse; 
+                                std::string hostHeaderVal = "";
+
                                 {
                                     const std::string headersPart = clientBuffers[i].substr(0, headerEnd);
                                     std::istringstream hs(headersPart);
@@ -417,7 +470,6 @@ void Server::start() {
                                         if (name == "content-length") {
                                             std::istringstream iss(value); size_t tmp = 0; iss >> tmp; contentLength = tmp; hasContentLength = true;
                                         } else if (name == "transfer-encoding") {
-                                            
                                             std::string lowerVal = value;
                                             for (size_t k = 0; k < lowerVal.size(); ++k) { char c = lowerVal[k]; if (c >= 'A' && c <= 'Z') lowerVal[k] = c + 32; }
                                             if (lowerVal.find("chunked") != std::string::npos) {
@@ -430,6 +482,8 @@ void Server::start() {
                                             if (lowerVal.find("100-continue") != std::string::npos) {
                                                 expectContinue = true;
                                             }
+                                        } else if (name == "host") {
+                                            hostHeaderVal = value;
                                         }
                                     }
                                     {
@@ -442,17 +496,23 @@ void Server::start() {
                                         }
                                         std::ofstream lf("server.log", std::ios::app);
                                         if (lf.is_open()) {
+                                            // Look up config to log correct max body size
+                                            const ConfigParser::ServerConfig& dbgConfig = selectConfig(port, hostHeaderVal);
                                             lf << "Headers: method=" << methodDbg
                                                << " uri=" << uriDbg
                                                << " hasCL=" << (hasContentLength?"1":"0")
                                                << " CL=" << contentLength
                                                << " chunked=" << (isChunked?"1":"0")
                                                << " expect100=" << (expectContinue?"1":"0")
-                                               << " max=" << currentConfig.clientMaxBodySize
+                                               << " max=" << dbgConfig.clientMaxBodySize
+                                               << " host=" << hostHeaderVal
                                                << std::endl;
                                         }
                                     }
                                 }
+                                
+                                // Select the correct config based on port and Host header
+                                const ConfigParser::ServerConfig& requestConfig = selectConfig(port, hostHeaderVal);
 
                                 bool handledEarly = false;
                                 {
@@ -466,7 +526,7 @@ void Server::start() {
                                             std::string uri = requestLine.substr(sp1 + 1, sp2 - (sp1 + 1));
 
                                             bool endsWithBlaUri = uri.size() >= 4 && uri.compare(uri.size()-4, 4, ".bla") == 0;
-                                            const LocationConfig& earlyLoc = findLocationConfig(currentConfig, uri);
+                                            const LocationConfig& earlyLoc = findLocationConfig(requestConfig, uri);
                                             bool hasCgiPass = !earlyLoc.getCgiPass().empty();
                                             bool isPotentialCgi = (uri.find("/cgi-bin/") != std::string::npos) ||
                                                                   (uri.find(".php") != std::string::npos) ||
@@ -477,14 +537,14 @@ void Server::start() {
                                             bool isPostBodySpecial = (method == "POST" && uri.find("/post_body") == 0);
 
                                             if (!isPotentialCgi && !isPostBodySpecial) {
-                                                std::set<std::string> allowed = getAllowedMethodsForPath(uri, currentConfig);
+                                                std::set<std::string> allowed = getAllowedMethodsForPath(uri, requestConfig);
                                                 if (allowed.find(method) == allowed.end()) {
                                                     HttpResponse resp;
                                                     resp.setStatus(405);
                                                     
                                                     std::string allowHeader = ""; for (std::set<std::string>::const_iterator it = allowed.begin(); it != allowed.end(); ++it) { if (it != allowed.begin()) allowHeader += ", "; allowHeader += *it; }
                                                     resp.setHeader("Allow", allowHeader);
-                                                    serveErrorPage(resp, 405, currentConfig);
+                                                    serveErrorPage(resp, 405, requestConfig);
                                                     resp.setHeader("Connection", "close");
                                                     keepAliveMap[i] = false;
                                                     responseBuffers[i] = resp.generateResponse(method == "HEAD");
@@ -501,19 +561,19 @@ void Server::start() {
                                 if (handledEarly) {
                                     goto next_fd;
                                 } else {
-                                    if (hasContentLength && currentConfig.clientMaxBodySize > 0 && (long)contentLength > currentConfig.clientMaxBodySize) {
+                                    if (hasContentLength && requestConfig.clientMaxBodySize > 0 && (long)contentLength > requestConfig.clientMaxBodySize) {
                                         std::cerr << "DEBUG: Rejecting request with Content-Length=" << contentLength
-                                                  << " exceeding client_max_body_size=" << currentConfig.clientMaxBodySize << std::endl;
+                                                  << " exceeding client_max_body_size=" << requestConfig.clientMaxBodySize << std::endl;
                                         {
                                             std::ofstream logFile("server.log", std::ios::app);
                                             if (logFile.is_open()) {
                                                 logFile << "413 early reject: Content-Length " << contentLength
-                                                       << " > max " << currentConfig.clientMaxBodySize << std::endl;
+                                                       << " > max " << requestConfig.clientMaxBodySize << std::endl;
                                             }
                                         }
                                         HttpResponse resp;
                                         resp.setStatus(413);
-                                        serveErrorPage(resp, 413, currentConfig);
+                                        serveErrorPage(resp, 413, requestConfig);
                                         resp.setHeader("Connection", "close");
                                         keepAliveMap[i] = false;
                                         responseBuffers[i] = resp.generateResponse(false);
@@ -588,15 +648,15 @@ void Server::start() {
                                                 break;
                                             }
                                             if (clientBuffers[i].size() < pos + chunkSize + 2) break;
-                                            if (currentConfig.clientMaxBodySize > 0 && (long)(chunkedDecoded[i].size() + chunkSize) > currentConfig.clientMaxBodySize) {
-                                                std::cerr << "DEBUG: Rejecting chunked request: next chunk " << chunkSize << " would exceed max body " << currentConfig.clientMaxBodySize << std::endl;
+                                            if (requestConfig.clientMaxBodySize > 0 && (long)(chunkedDecoded[i].size() + chunkSize) > requestConfig.clientMaxBodySize) {
+                                                std::cerr << "DEBUG: Rejecting chunked request: next chunk " << chunkSize << " would exceed max body " << requestConfig.clientMaxBodySize << std::endl;
                                                 {
                                                     std::ofstream logFile("server.log", std::ios::app);
                                                     if (logFile.is_open()) {
-                                                        logFile << "413 early reject: chunked, next chunk " << chunkSize << " causes total > max " << currentConfig.clientMaxBodySize << std::endl;
+                                                        logFile << "413 early reject: chunked, next chunk " << chunkSize << " causes total > max " << requestConfig.clientMaxBodySize << std::endl;
                                                     }
                                                 }
-                                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, currentConfig); resp.setHeader("Connection", "close");
+                                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, requestConfig); resp.setHeader("Connection", "close");
                                                 keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
                                                 size_t consumedHdr2 = headerEnd + 4; if (clientBuffers[i].size() > consumedHdr2) clientBuffers[i].erase(0, consumedHdr2); else clientBuffers[i].clear();
                                                 
@@ -625,7 +685,9 @@ void Server::start() {
                                         if (!normalizedRequestForParse.empty()) request.parseRequest(normalizedRequestForParse);
                                         else request.parseRequest(clientBuffers[i]);
                                         HttpResponse response;
-                                        dispatchRequest(request, response, currentConfig);
+                                        
+                                        // Update config selection in dispatch as well if needed, but we have correct config here
+                                        dispatchRequest(request, response, requestConfig);
 
                                         std::string connectionHeader = request.getHeader("Connection");
                                         std::string version = request.getVersion();
@@ -671,7 +733,9 @@ void Server::start() {
                             }
                             else {
                                 if (clientBuffers[i].size() > MAX_HEADER_BYTES) {
-                                    HttpResponse resp; resp.setStatus(431); serveErrorPage(resp, 431, currentConfig); resp.setHeader("Connection", "close");
+                                    int port = clientPortMap[i];
+                                    const ConfigParser::ServerConfig& tempConfig = selectConfig(port, "");
+                                    HttpResponse resp; resp.setStatus(431); serveErrorPage(resp, 431, tempConfig); resp.setHeader("Connection", "close");
                                     keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
                                     clientBuffers[i].clear();
                                     goto next_fd;
@@ -683,6 +747,7 @@ void Server::start() {
                             sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
                             chunkedInited.erase(i); chunkedPos.erase(i); chunkedDecoded.erase(i);
                             chunkedReqLine.erase(i); chunkedNewHeaders.erase(i); chunkedComplete.erase(i); chunkedConsumedEnd.erase(i);
+                            clientPortMap.erase(i);
                             break;
                         } else {
                             if (errno == EWOULDBLOCK || errno == EAGAIN) {
@@ -694,6 +759,7 @@ void Server::start() {
                                 sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
                                 chunkedInited.erase(i); chunkedPos.erase(i); chunkedDecoded.erase(i);
                                 chunkedReqLine.erase(i); chunkedNewHeaders.erase(i); chunkedComplete.erase(i); chunkedConsumedEnd.erase(i);
+                                clientPortMap.erase(i);
                                 break;
                             }
                         }
@@ -717,6 +783,7 @@ void Server::start() {
                                     close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
                                     clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
                                     sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
+                                    clientPortMap.erase(i);
                                     goto next_fd; 
                                 }
                             }
@@ -744,6 +811,7 @@ void Server::start() {
                                     close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
                                     clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
                                     sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
+                                    clientPortMap.erase(i);
                                     goto next_fd; 
                                 }
                             }
@@ -755,6 +823,7 @@ void Server::start() {
                                 close(i); FD_CLR(i, &master_read);
                                 clientBuffers.erase(i); keepAliveMap.erase(i); 
                                 sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
+                                clientPortMap.erase(i);
                             } else {
                                 sentContinueMap[i] = false;
                                 continueBuffers.erase(i);

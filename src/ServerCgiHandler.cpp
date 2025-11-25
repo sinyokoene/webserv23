@@ -89,7 +89,7 @@ void Server::handleCgiRequest(HttpRequest& request, HttpResponse& response,
     if (!cgiPassValue.empty()) std::cerr << "DEBUG[CGI]: cgi_pass='" << cgiPassValue << "'" << std::endl;
 
     // Always map the requested URI to a filesystem path (for SCRIPT_FILENAME)
-    std::string mappedScriptPath = resolvePath(effectiveRoot, request.getPath());
+    std::string mappedScriptPath = resolvePath(config, effectiveRoot, request.getPath());
     std::cerr << "DEBUG[CGI]: mappedScriptPath='" << mappedScriptPath << "' effectiveRoot='" << effectiveRoot << "'" << std::endl;
     
     // For SCRIPT_FILENAME environment variable, always use the mapped filesystem path.
