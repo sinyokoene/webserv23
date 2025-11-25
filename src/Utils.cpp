@@ -1,5 +1,8 @@
 #include "Utils.hpp"
 #include <iostream>
+#include <dirent.h>
+#include <cstdio>
+#include <cstring> // For strcmp
 
 // Function to trim whitespace from both ends of a string
 std::string trim(const std::string &str) {
@@ -74,4 +77,41 @@ bool createDirectoriesRecursively(const std::string& dirPath) {
         }
     }
     return true;
+}
+
+// Function to delete directories recursively
+bool deleteDirectoryRecursively(const std::string& path) {
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        return false;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+
+        std::string fullPath = path;
+        if (!fullPath.empty() && fullPath[fullPath.length() - 1] != '/') fullPath += "/";
+        fullPath += name;
+
+        struct stat st;
+        if (stat(fullPath.c_str(), &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                if (!deleteDirectoryRecursively(fullPath)) {
+                    closedir(dir);
+                    return false;
+                }
+            } else {
+                if (remove(fullPath.c_str()) != 0) {
+                    closedir(dir);
+                    return false;
+                }
+            }
+        }
+    }
+    closedir(dir);
+    return rmdir(path.c_str()) == 0;
 }

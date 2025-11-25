@@ -354,7 +354,7 @@ void Server::handleDeleteRequest(HttpRequest& request, HttpResponse& response,
         return;
     }
 
-    // Check if the file exists and is a regular file
+    // Check if the file exists
     struct stat st;
     if (stat(resolvedPath.c_str(), &st) != 0) {
         response.setStatus(404); // Not Found
@@ -362,21 +362,26 @@ void Server::handleDeleteRequest(HttpRequest& request, HttpResponse& response,
         return;
     }
 
-    if (!S_ISREG(st.st_mode)) {
-        // Sta alleen het verwijderen van reguliere bestanden toe, geen mappen of speciale bestanden
-        response.setStatus(403); // Verboden
+    bool success = false;
+    if (S_ISDIR(st.st_mode)) {
+        success = deleteDirectoryRecursively(resolvedPath);
+    } else if (S_ISREG(st.st_mode)) {
+        success = (remove(resolvedPath.c_str()) == 0);
+    } else {
+        // Allow only regular files and directories, no special files
+        response.setStatus(403); // Forbidden
         serveErrorPage(response, 403, config);
         return;
     }
 
-    // Probeer het bestand te verwijderen
-    if (remove(resolvedPath.c_str()) == 0) { // remove is in cstdio of unistd.h
+    // Try to delete
+    if (success) {
         response.setStatus(200); // OK
-        response.setBody("<html><body><h1>File deleted successfully</h1></body></html>");
+        response.setBody("<html><body><h1>Deleted successfully</h1></body></html>");
         response.setHeader("Content-Type", "text/html");
     } else {
-        // Fout bij verwijderen (machtigingen, enz.)
-        response.setStatus(500); // Interne Serverfout
+        // Error deleting (permissions, etc.)
+        response.setStatus(500); // Internal Server Error
         serveErrorPage(response, 500, config);
     }
 }

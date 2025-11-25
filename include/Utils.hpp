@@ -25,4 +25,7 @@ std::string basenameLike(const std::string& path);
 // Function to create directories recursively
 bool createDirectoriesRecursively(const std::string& dirPath);
 
+// Function to delete directories recursively
+bool deleteDirectoryRecursively(const std::string& path);
+
 #endif // UTILS_HPP
