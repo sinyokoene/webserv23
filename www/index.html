@@ -8,27 +8,34 @@
 </head>
 <body>
     <header>
-        <h1>Welcome to WebServ</h1>
-        <img src="images/logo.png" alt="WebServ Logo">
+        <div class="header-content">
+            <h1>WebServ</h1>
+            <nav>
+                <a href="/">Home</a>
+                <a href="/upload.html">Upload</a>
+                <a href="/cgi.html">CGI</a>
+            </nav>
+        </div>
     </header>
     <main>
-        <section>
+        <section class="card">
             <h2>About</h2>
             <p>WebServ is Working! This is a sample static site for testing the web server functionality.</p>
         </section>
-        <section>
+        <section class="card">
             <h2>Features</h2>
             <ul>
                 <li>Static file serving</li>
                 <li>Custom error pages</li>
                 <li>File uploads</li>
+                <li>CGI execution</li>
             </ul>
         </section>
-        <section>
-            <h2>Test Pages</h2>
-            <div class="test-links">
+        <section class="card">
+            <h2>Navigation</h2>
+            <div class="nav-links">
                 <a href="/test.html">Test Page</a>
-                <a href="/styles.css">CSS File</a>
+                <a href="/styles.css">View CSS</a>
                 <a href="/nonexistent.html">404 Test</a>
                 <a href="/upload.html">Upload Tester</a>
                 <a href="/cgi.html">CGI Demo</a>
