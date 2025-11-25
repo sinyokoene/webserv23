@@ -42,8 +42,6 @@ private:
     // Helper methods for parsing
     void parseServerBlock(std::ifstream& file, std::string& line);
     void parseLocationBlock(std::ifstream& file, std::string& line, LocationConfig& location, bool isDefaultLocation);
-    std::string trim(const std::string& str);
-    std::vector<std::string> split(const std::string& s, char delimiter);
 
 };
 

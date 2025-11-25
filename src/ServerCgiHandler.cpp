@@ -1,16 +1,11 @@
 #include "Server.hpp"
-
-// Current CGI handler uses blocking pipes and waitpid. For full compliance,
-// consider refactoring to integrate pipe FDs into the main select() loop with
-// non-blocking reads/writes and timeouts.
+#include "Utils.hpp"
 
 // Helper to convert HttpRequest to environment variables
 static std::vector<char*> createCgiEnv(HttpRequest& request,
                                        const ConfigParser::ServerConfig& config,
                                        const LocationConfig& locConfig,
-                                       const std::string& scriptPath,
-                                       const std::string& effectiveRoot) {
-    (void)effectiveRoot; // not used after simplifying PATH_TRANSLATED
+                                       const std::string& scriptPath) {
     std::map<std::string, std::string> envMap;
 
     // Server and request specific variables
@@ -149,7 +144,7 @@ void Server::handleCgiRequest(HttpRequest& request, HttpResponse& response,
         close(pipe_out[1]);
         
         // Build environment with SCRIPT_FILENAME set to the appropriate script path
-        std::vector<char*> cgiEnv = createCgiEnv(request, config, locConfig, scriptFilename, effectiveRoot);
+        std::vector<char*> cgiEnv = createCgiEnv(request, config, locConfig, scriptFilename);
         
         // Prepare arguments for execve
         // If cgi_pass is provided, it is the interpreter; pass mapped script as argv[1]

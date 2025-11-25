@@ -1,20 +1,11 @@
 #include "Server.hpp"
-
-// Helpers
-static inline std::string toLowerAscii(const std::string& s) {
-    std::string out = s;
-    for (size_t i = 0; i < out.size(); ++i) { char c = out[i]; if (c >= 'A' && c <= 'Z') out[i] = c + 32; }
-    return out;
-}
-
-static inline std::string basenameLike(const std::string& path) {
-    size_t slash = path.find_last_of("/\\");
-    return (slash == std::string::npos) ? path : path.substr(slash + 1);
-}
+#include "Utils.hpp"
+#include <sys/stat.h>
+#include <dirent.h>
 
 static std::string extractFilenameFromContentDisposition(const std::string& headerValue) {
     // Try RFC5987 filename* first
-    std::string low = toLowerAscii(headerValue);
+    std::string low = toLower(headerValue);
     size_t fnstar = low.find("filename*=");
     if (fnstar != std::string::npos) {
         std::string rest = headerValue.substr(fnstar + 10);
@@ -57,38 +48,6 @@ static bool setContentLengthFromFile(HttpResponse& response, const std::string& 
     std::streamsize size = file.tellg();
     std::ostringstream sizeStr; sizeStr << size;
     response.setHeader("Content-Length", sizeStr.str());
-    return true;
-}
-
-// Create directories recursively (like mkdir -p)
-static bool createDirectoriesRecursively(const std::string& dirPath) {
-    if (dirPath.empty()) return false;
-    std::string path;
-    size_t i = 0;
-    if (dirPath[0] == '/') { path = "/"; i = 1; }
-    for (; i < dirPath.size(); ++i) {
-        char ch = dirPath[i];
-        if (ch == '/') {
-            if (!path.empty() && path[path.size()-1] != '/') {
-                struct stat st;
-                if (stat(path.c_str(), &st) != 0) {
-                    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) return false;
-                } else if (!S_ISDIR(st.st_mode)) {
-                    return false;
-                }
-            }
-        }
-        path += ch;
-    }
-    // final directory
-    if (!path.empty()) {
-        struct stat st;
-        if (stat(path.c_str(), &st) != 0) {
-            if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) return false;
-        } else if (!S_ISDIR(st.st_mode)) {
-            return false;
-        }
-    }
     return true;
 }
 
@@ -259,7 +218,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
         const std::string& body = request.getBody();
 
         // Check for multipart
-        std::string ctLower = toLowerAscii(contentType);
+        std::string ctLower = toLower(contentType);
         if (ctLower.find("multipart/form-data") != std::string::npos) {
             // Extract boundary parameter robustly
             std::string boundary;
@@ -271,7 +230,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
                     // trim
                     size_t f = token.find_first_not_of(" \t"); if (f != std::string::npos) token = token.substr(f); else token.clear();
                     size_t l = token.find_last_not_of(" \t"); if (l != std::string::npos) token = token.substr(0, l + 1);
-                    std::string low = toLowerAscii(token);
+                    std::string low = toLower(token);
                     if (low.find("boundary=") == 0) {
                         std::string val = token.substr(9);
                         // strip quotes
@@ -301,7 +260,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
                     std::string filename;
                     while (std::getline(ph, hline)) {
                         if (!hline.empty() && hline[hline.size()-1] == '\r') hline.erase(hline.size()-1);
-                        std::string lower = toLowerAscii(hline);
+                        std::string lower = toLower(hline);
                         if (lower.find("content-disposition:") == 0) {
                             filename = extractFilenameFromContentDisposition(hline);
                         }

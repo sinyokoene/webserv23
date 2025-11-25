@@ -1,6 +1,6 @@
 CC = c++
 CFLAGS = -Wall -Wextra -Werror -std=c++98 -Iinclude
-SRC = src/main.cpp src/ConfigParser.cpp src/HttpRequest.cpp src/HttpResponse.cpp src/Server.cpp src/ServerHandlers.cpp src/LocationConfig.cpp src/Socket.cpp src/Utils.cpp src/ServerCgiHandler.cpp
+SRC = src/main.cpp src/ConfigParser.cpp src/HttpRequest.cpp src/HttpResponse.cpp src/Server.cpp src/ServerHandlers.cpp src/LocationConfig.cpp src/Utils.cpp src/ServerCgiHandler.cpp
 OBJ_DIR = obj
 OBJ = $(SRC:src/%.cpp=$(OBJ_DIR)/%.o)
 NAME = webserv

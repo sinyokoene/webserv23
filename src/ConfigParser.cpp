@@ -1,34 +1,5 @@
 #include "ConfigParser.hpp"
-
-// Helper function to trim whitespace from both ends of a string
-std::string ConfigParser::trim(const std::string& str) {
-    if (str.empty()) {
-        return "";
-    }
-    size_t first = 0;
-    while (first < str.length() && isspace(static_cast<unsigned char>(str[first]))) {
-        first++;
-    }
-    if (first == str.length()) { // All whitespace
-        return "";
-    }
-    size_t last = str.length() - 1;
-    while (last > first && isspace(static_cast<unsigned char>(str[last]))) {
-        last--;
-    }
-    return str.substr(first, last - first + 1);
-}
-
-// Helper function to split a string by a delimiter
-std::vector<std::string> ConfigParser::split(const std::string& s, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(s);
-    while (std::getline(tokenStream, token, delimiter)) {
-        tokens.push_back(trim(token));
-    }
-    return tokens;
-}
+#include "Utils.hpp"
 
 ConfigParser::ConfigParser(const std::string& configFile) : configFile(configFile) {
     // Constructor - configuration will be parsed when parse() is called
@@ -57,11 +28,6 @@ void ConfigParser::parse() {
 
     if (servers.empty()) {
         std::cerr << "Warning: No server blocks found in configuration. Using default server settings." << std::endl;
-        // Optionally, create a default server configuration if none are parsed
-        // servers.push_back(ServerConfig()); // Example: Add a default server
-        // servers.back().listenPorts.push_back("8080"); // Default port
-        // servers.back().root = "./www"; // Default root
-        // servers.back().defaultLocationSettings.setRoot(servers.back().root);
     }
 }
 
@@ -202,7 +168,7 @@ void ConfigParser::parseServerBlock(std::ifstream& file, std::string& line) {
                     std::cerr << "Warning: Location path '/" << path_part << "/' might be complex or contain spaces. Using '" << locationPath << "'." << std::endl;
                 }
             } else { 
-                 locationPath = firstToken;
+                locationPath = firstToken;
             }
             
             locationPath = trim(locationPath);

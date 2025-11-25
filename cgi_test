@@ -1,0 +1,14 @@
+#!/bin/bash
+echo "Content-Type: text/html"
+echo "Status: 200"
+echo ""
+echo "<html><body><h1>CGI Tester (Mac Mock)</h1>"
+echo "<p>The provided ubuntu_cgi_tester binary is for Linux. This is a script replacement for macOS.</p>"
+echo "<h2>Environment Variables</h2><ul>"
+env | grep "^HTTP_" | sort | sed 's/^/<li>/' | sed 's/$/<\/li>/'
+echo "</ul>"
+echo "<h2>Body</h2><pre>"
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    cat
+fi
+echo "</pre></body></html>"

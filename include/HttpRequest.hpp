@@ -25,8 +25,6 @@ private:
     std::string version;
     std::map<std::string, std::string> headers;
     std::string body;
-
-    void parseHeaders(const std::string& request);
 };
 
 #endif // HTTPREQUEST_HPP

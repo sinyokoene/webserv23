@@ -775,16 +775,6 @@ void Server::start() {
     }
 }
 
-void Server::processClientData(int clientSocket,
-                               fd_set& master_set,
-                               int& fdmax,
-                               std::map<int, std::string>& clientBuffers,
-                               std::map<int, std::string>& responseBuffers,
-                               std::map<int, size_t>& sendOffsets,
-                               std::map<int, bool>& keepAliveMap,
-                               std::map<int, time_t>& lastActivity) {
-    (void)clientSocket; (void)master_set; (void)fdmax; (void)clientBuffers; (void)responseBuffers; (void)sendOffsets; (void)keepAliveMap; (void)lastActivity;
-}
 
 void Server::dispatchRequest(HttpRequest& request, HttpResponse& response, const ConfigParser::ServerConfig& config) {
     const LocationConfig& locConfig = findLocationConfig(config, request.getPath());

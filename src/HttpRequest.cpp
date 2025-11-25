@@ -1,16 +1,8 @@
 #include "HttpRequest.hpp"
+#include "Utils.hpp"
 
 HttpRequest::HttpRequest() {
     // Initialize request data
-}
-
-static inline std::string toLowerAscii(const std::string& s) {
-    std::string out = s;
-    for (size_t i = 0; i < out.size(); ++i) {
-        char c = out[i];
-        if (c >= 'A' && c <= 'Z') out[i] = c + 32;
-    }
-    return out;
 }
 
 void HttpRequest::parseRequest(const std::string& request) {
@@ -60,7 +52,7 @@ void HttpRequest::parseRequest(const std::string& request) {
             size_t first = value.find_first_not_of(" \t");
             if (first != std::string::npos) value = value.substr(first); else value.clear();
             // normalize header names to lowercase for case-insensitive access
-            headers[toLowerAscii(key)] = value;
+            headers[toLower(key)] = value;
         }
     }
 
@@ -86,7 +78,7 @@ std::string HttpRequest::getHeader(const std::string& headerName) const {
         return it->second;
     }
     // case-insensitive lookup (headers are stored as lowercase)
-    std::string lower = toLowerAscii(headerName);
+    std::string lower = toLower(headerName);
     it = headers.find(lower);
     if (it != headers.end()) {
         return it->second;
@@ -108,9 +100,4 @@ std::string HttpRequest::getQueryString() const {
 
 const std::map<std::string, std::string>& HttpRequest::getHeaders() const {
     return headers;
-}
-
-void HttpRequest::parseHeaders(const std::string& request) {
-    // Deprecated: headers are parsed directly in parseRequest from the header section
-    (void)request;
 }
