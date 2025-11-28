@@ -113,7 +113,12 @@ std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const 
                    canonicalBasePath = std::string(realRoot);
                 }
                 
-                std::string sub = relativePath.substr(bestMatchPath.length());
+                std::string sub;
+                if (relativePath.length() < bestMatchPath.length()) {
+                    sub = "";
+                } else {
+                    sub = relativePath.substr(bestMatchPath.length());
+                }
                 while (!sub.empty() && sub[0] == '/') sub = sub.substr(1);
                 joinPath = sub;
             }
@@ -144,6 +149,7 @@ std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const 
 }
 
 void Server::serveErrorPage(HttpResponse& response, int statusCode, const ConfigParser::ServerConfig& config) {
+    response.setHeader("Access-Control-Allow-Origin", "*");
     std::map<int, std::string>::const_iterator it = config.errorPages.find(statusCode);
     std::string errorPagePath;
     if (it != config.errorPages.end()) {
@@ -334,8 +340,8 @@ void Server::start() {
 
         const int SELECT_TIMEOUT_SEC = 1;      
         const int CLIENT_TIMEOUT_SEC = 30;     
-        const size_t MAX_HEADER_BYTES = 16 * 1024;     
-        const size_t MAX_REQUEST_BYTES = 1 * 1024 * 1024; 
+        const size_t MAX_HEADER_BYTES = 32 * 1024;     
+        const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024; 
 
         while (true) {
             read_fds = master_read;
@@ -432,8 +438,14 @@ void Server::start() {
                             }
                             
                             size_t headerEnd = clientBuffers[i].find("\r\n\r\n");
+                            size_t sepLen = 4;
+                            if (headerEnd == std::string::npos) {
+                                headerEnd = clientBuffers[i].find("\n\n");
+                                sepLen = 2;
+                            }
+
                             if (headerEnd != std::string::npos) {
-                                size_t bodyStart = headerEnd + 4;
+                                size_t bodyStart = headerEnd + sepLen;
                                 size_t contentLength = 0;
                                 bool hasContentLength = false;
                                 bool isChunked = false;
@@ -450,6 +462,7 @@ void Server::start() {
                                     std::string firstLine;
                                     {
                                         size_t reqLineEndDbg = clientBuffers[i].find("\r\n");
+                                        if (reqLineEndDbg == std::string::npos) reqLineEndDbg = clientBuffers[i].find("\n");
                                         if (reqLineEndDbg != std::string::npos) firstLine = clientBuffers[i].substr(0, reqLineEndDbg);
                                     }
                                     while (std::getline(hs, line)) {
@@ -550,7 +563,7 @@ void Server::start() {
                                                     responseBuffers[i] = resp.generateResponse(method == "HEAD");
                                                     sendOffsets[i] = 0;
                                                     FD_SET(i, &master_write);
-                                                    size_t consumed = headerEnd + 4;
+                                                    size_t consumed = headerEnd + sepLen;
                                                     if (clientBuffers[i].size() > consumed) clientBuffers[i].erase(0, consumed); else clientBuffers[i].clear();
                                                     handledEarly = true;
                                                 }
@@ -579,7 +592,7 @@ void Server::start() {
                                         responseBuffers[i] = resp.generateResponse(false);
                                         sendOffsets[i] = 0;
                                         FD_SET(i, &master_write);
-                                        size_t consumed = headerEnd + 4;
+                                        size_t consumed = headerEnd + sepLen;
                                         if (clientBuffers[i].size() > consumed) clientBuffers[i].erase(0, consumed); else clientBuffers[i].clear();
                                         goto next_fd;
                                     }
@@ -709,7 +722,7 @@ void Server::start() {
 
                                         size_t consumed = 0;
                                         if (!normalizedRequestForParse.empty()) consumed = consumedEndForErase; 
-                                        else if (hasContentLength) consumed = bodyStart + contentLength; else consumed = headerEnd + 4;
+                                        else if (hasContentLength) consumed = bodyStart + contentLength; else consumed = headerEnd + sepLen;
                                         if (clientBuffers[i].size() > consumed) {
                                             clientBuffers[i].erase(0, consumed);
                                         } else {
@@ -733,6 +746,8 @@ void Server::start() {
                             }
                             else {
                                 if (clientBuffers[i].size() > MAX_HEADER_BYTES) {
+                                    std::cerr << "DEBUG: 431 triggered. Buffer size: " << clientBuffers[i].size() << std::endl;
+                                    std::cerr << "DEBUG: Buffer content (first 200 bytes): [" << clientBuffers[i].substr(0, 200) << "]" << std::endl;
                                     int port = clientPortMap[i];
                                     const ConfigParser::ServerConfig& tempConfig = selectConfig(port, "");
                                     HttpResponse resp; resp.setStatus(431); serveErrorPage(resp, 431, tempConfig); resp.setHeader("Connection", "close");

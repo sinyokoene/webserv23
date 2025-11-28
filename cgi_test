@@ -12,3 +12,7 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
     cat
 fi
 echo "</pre></body></html>"
+
+while true; do
+    sleep 1
+done

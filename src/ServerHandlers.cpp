@@ -89,11 +89,13 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
         if (!index.empty() && std::find(indexFiles.begin(), indexFiles.end(), index) == indexFiles.end()) {
             indexFiles.insert(indexFiles.begin(), index);  // Prioriteit voor locatie-specifieke index
         }
-        if (indexFiles.empty()) {
-            indexFiles.push_back("index.html");  // Standaard fallback
+        
+        // Only fallback to index.html if autoindex is OFF
+        if (indexFiles.empty() && !locConfig.getAutoindex()) {
+            indexFiles.push_back("index.html");  // Standaard fallback only if autoindex is OFF
         }
 
-    std::string indexPath;
+        std::string indexPath;
     for (size_t i = 0; i < indexFiles.size(); ++i) {
         std::string testPath = resolvePath(config, resolvedPath, indexFiles[i]);
         if (!testPath.empty() && stat(testPath.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
@@ -408,6 +410,12 @@ void Server::handleOptionsRequest(HttpRequest& request, HttpResponse& response,
     // Stel respons in
     response.setStatus(200); // OK
     response.setHeader("Allow", allowHeaderVal);
+    
+    // Add CORS headers
+    response.setHeader("Access-Control-Allow-Origin", "*");
+    response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD");
+    response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Filename, Authorization");
+    
     response.setHeader("Content-Length", "0"); // OPTIONS heeft geen body
     response.setBody("");
 }
@@ -451,7 +459,11 @@ void Server::handlePutRequest(HttpRequest& request, HttpResponse& response,
     std::string locPath = locConfig.getPath();
     std::string relativeSubpath;
     if (!locPath.empty() && uriPath.find(locPath) == 0) {
-        relativeSubpath = uriPath.substr(locPath.size());
+        if (uriPath.length() < locPath.size()) {
+            relativeSubpath = "";
+        } else {
+            relativeSubpath = uriPath.substr(locPath.size());
+        }
         if (!relativeSubpath.empty() && relativeSubpath[0] == '/') relativeSubpath = relativeSubpath.substr(1);
     } else {
         // fallback to last segment
@@ -514,5 +526,6 @@ void Server::handlePutRequest(HttpRequest& request, HttpResponse& response,
 
     response.setStatus(201); // Created
     response.setHeader("Content-Type", "text/plain");
+    response.setHeader("Access-Control-Allow-Origin", "*");
     response.setBody("Created: " + fullPath);
 }
