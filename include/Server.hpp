@@ -1,13 +1,28 @@
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
-#include <sys/select.h> // fd_set
-#include <sys/types.h>  // pid_t, off_t
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
+#include <cerrno>
+#include <csignal>
 #include <cstddef>
-#include <ctime> // time_t
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iostream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
