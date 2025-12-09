@@ -1,5 +1,6 @@
 #include "Server.hpp"
 #include "Utils.hpp"
+#include <signal.h>
 
 Server::Server(const std::string& configFile) {
     configPath = configFile;
@@ -232,9 +233,9 @@ void Server::start() {
 
         if (serverConfigs.empty()) {
             // Fallback to currentConfig (emergency default) if no configs parsed
-            for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
-                 it != currentConfig.listenPorts.end(); ++it) {
-                 int port = atoi(it->c_str());
+        for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
+            it != currentConfig.listenPorts.end(); ++it) {
+            int port = atoi(it->c_str());
                  if (port > 0 && port <= 65535) {
                      portsToBind.insert(port);
                      portToConfigs[port].push_back(&currentConfig);
@@ -265,7 +266,7 @@ void Server::start() {
                 std::cerr << "Error creating socket for port " << port << ": " << strerror(errno) << std::endl;
                 continue;
             }
-
+            
             int flags = fcntl(serverSocket, F_GETFL, 0);
             if (flags != -1) fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
 
@@ -347,6 +348,23 @@ void Server::start() {
             read_fds = master_read;
             write_fds = master_write;
 
+            // Add CGI pipes to fdsets
+            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
+                CgiState& cgi = cit->second;
+                
+                // Add CGI stdout to read set if still reading
+                if (cgi.pipe_out != -1 && !cgi.readComplete) {
+                    FD_SET(cgi.pipe_out, &read_fds);
+                    if (cgi.pipe_out > fdmax) fdmax = cgi.pipe_out;
+                }
+                
+                // Add CGI stdin to write set if still writing
+                if (cgi.pipe_in != -1 && !cgi.writeComplete) {
+                    FD_SET(cgi.pipe_in, &write_fds);
+                    if (cgi.pipe_in > fdmax) fdmax = cgi.pipe_in;
+                }
+            }
+
             struct timeval tv; tv.tv_sec = SELECT_TIMEOUT_SEC; tv.tv_usec = 0;
             int nready = select(fdmax + 1, &read_fds, &write_fds, NULL, &tv);
             if (nready == -1) {
@@ -360,6 +378,16 @@ void Server::start() {
             for (std::map<int, time_t>::iterator it = lastActivity.begin(); it != lastActivity.end(); ) {
                 int fd = it->first; time_t last = it->second;
                 if (now - last > CLIENT_TIMEOUT_SEC) {
+                    // Clean up CGI if active
+                    std::map<int, CgiState>::iterator cgit = cgiStates.find(fd);
+                    if (cgit != cgiStates.end()) {
+                        if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
+                        if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
+                        kill(cgit->second.pid, SIGKILL);
+                        waitpid(cgit->second.pid, NULL, WNOHANG);
+                        cgiStates.erase(cgit);
+                    }
+                    
                     close(fd);
                     FD_CLR(fd, &master_read);
                     FD_CLR(fd, &master_write);
@@ -384,9 +412,80 @@ void Server::start() {
                 }
             }
 
+            // Handle CGI I/O and completion
+            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
+                CgiState& cgi = cit->second;
+                int clientFd = cit->first;
+                
+                // Check CGI timeout
+                if (now - cgi.lastIO > 120) { // 120 second timeout
+                    std::cerr << "CGI timeout for client " << clientFd << std::endl;
+                    if (cgi.pipe_in != -1) { close(cgi.pipe_in); cgi.pipe_in = -1; }
+                    if (cgi.pipe_out != -1) { close(cgi.pipe_out); cgi.pipe_out = -1; }
+                    kill(cgi.pid, SIGKILL);
+                    waitpid(cgi.pid, NULL, WNOHANG);
+                    
+                    HttpResponse response;
+                    serveErrorPage(response, 504, *cgi.config);
+                    responseBuffers[clientFd] = response.generateResponse(cgi.isHead);
+                    sendOffsets[clientFd] = 0;
+                    FD_SET(clientFd, &master_write);
+                    cgiStates.erase(cit++);
+                    continue;
+                }
+                
+                // Handle CGI writes
+                if (cgi.pipe_in != -1 && FD_ISSET(cgi.pipe_in, &write_fds)) {
+                    handleCgiWrite(clientFd, cgi);
+                }
+                
+                // Handle CGI reads
+                if (cgi.pipe_out != -1 && FD_ISSET(cgi.pipe_out, &read_fds)) {
+                    handleCgiRead(clientFd, cgi);
+                }
+                
+                // Check if CGI is complete
+                if (cgi.readComplete) {
+                    int status;
+                    pid_t result = waitpid(cgi.pid, &status, WNOHANG);
+                    if (result > 0) {  // Process exited
+                        std::string response;
+                        finalizeCgiRequest(clientFd, cgi, status, response);
+                        responseBuffers[clientFd] = response;
+                        sendOffsets[clientFd] = 0;
+                        FD_SET(clientFd, &master_write);
+                        cgiStates.erase(cit++);
+                        continue;
+                    } else if (result < 0) {
+                        std::cerr << "DEBUG[CGI]: Client " << clientFd << " waitpid error: " << strerror(errno) << std::endl;
+                        HttpResponse errResp;
+                        serveErrorPage(errResp, 500, *cgi.config);
+                        responseBuffers[clientFd] = errResp.generateResponse(cgi.isHead);
+                        sendOffsets[clientFd] = 0;
+                        FD_SET(clientFd, &master_write);
+                        cgiStates.erase(cit++);
+                        continue;
+                    }
+                    // else result == 0: process still running, wait longer
+                }
+                
+                ++cit;
+            }
+
             for (int i = 0; i <= fdmax; ++i) {
                 if (FD_ISSET(i, &read_fds)) {
                     
+                    // Check if it's a CGI pipe (skip, already handled above)
+                    bool isCgiPipe = false;
+                    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
+                        if (i == cit->second.pipe_out) {
+                            isCgiPipe = true;
+                            break;
+                        }
+                    }
+                    if (isCgiPipe) continue;
+                    
+                    // Check if it's a server socket
                     bool isServerSocket = false;
                     for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
                         if (i == *it) { isServerSocket = true; break; }
@@ -417,6 +516,11 @@ void Server::start() {
                             clientPortMap[clientSocket] = socketPortMap[i];
                         }
                         continue;
+                    }
+
+                    // Ensure this is actually a client socket (has buffer entry)
+                    if (clientBuffers.find(i) == clientBuffers.end()) {
+                        continue; // Not a client socket, skip
                     }
 
                     char buffer[8192];
@@ -699,26 +803,29 @@ void Server::start() {
                                         else request.parseRequest(clientBuffers[i]);
                                         HttpResponse response;
                                         
-                                        // Update config selection in dispatch as well if needed, but we have correct config here
-                                        dispatchRequest(request, response, requestConfig);
+                                        bool responseReady = false;
+                                        dispatchRequest(i, request, response, requestConfig, responseReady);
 
-                                        std::string connectionHeader = request.getHeader("Connection");
-                                        std::string version = request.getVersion();
-                                        std::string connLower = connectionHeader;
-                                        for (size_t k = 0; k < connLower.size(); ++k) { char c = connLower[k]; if (c >= 'A' && c <= 'Z') connLower[k] = c + 32; }
-                                        bool keepAlive = false;
-                                        if (version == "HTTP/1.1") {
-                                            keepAlive = (connLower != "close");
-                                        } else { 
-                                            keepAlive = (connLower == "keep-alive");
+                                        // Only send response if ready (non-CGI or synchronous handler)
+                                        if (responseReady) {
+                                            std::string connectionHeader = request.getHeader("Connection");
+                                            std::string version = request.getVersion();
+                                            std::string connLower = connectionHeader;
+                                            for (size_t k = 0; k < connLower.size(); ++k) { char c = connLower[k]; if (c >= 'A' && c <= 'Z') connLower[k] = c + 32; }
+                                            bool keepAlive = false;
+                                            if (version == "HTTP/1.1") {
+                                                keepAlive = (connLower != "close");
+                                            } else { 
+                                                keepAlive = (connLower == "keep-alive");
+                                            }
+                                            keepAliveMap[i] = keepAlive;
+                                            response.setHeader("Connection", keepAlive ? "keep-alive" : "close");
+
+                                            std::string resp = response.generateResponse(request.getMethod() == "HEAD");
+                                            responseBuffers[i] = resp;
+                                            sendOffsets[i] = 0;
+                                            FD_SET(i, &master_write);
                                         }
-                                        keepAliveMap[i] = keepAlive;
-                                        response.setHeader("Connection", keepAlive ? "keep-alive" : "close");
-
-                                        std::string resp = response.generateResponse(request.getMethod() == "HEAD");
-                                        responseBuffers[i] = resp;
-                                        sendOffsets[i] = 0;
-                                        FD_SET(i, &master_write);
 
                                         size_t consumed = 0;
                                         if (!normalizedRequestForParse.empty()) consumed = consumedEndForErase; 
@@ -757,6 +864,16 @@ void Server::start() {
                                 }
                             }
                         } else if (bytesRead == 0) {
+                            // Clean up CGI if active
+                            std::map<int, CgiState>::iterator cgit = cgiStates.find(i);
+                            if (cgit != cgiStates.end()) {
+                                if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
+                                if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
+                                kill(cgit->second.pid, SIGKILL);
+                                waitpid(cgit->second.pid, NULL, WNOHANG);
+                                cgiStates.erase(cgit);
+                            }
+                            
                             close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
                             clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
                             sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
@@ -769,6 +886,17 @@ void Server::start() {
                                 break; 
                             } else {
                                 std::cerr << "ERROR: fd " << i << " recv error: " << strerror(errno) << std::endl;
+                                
+                                // Clean up CGI if active
+                                std::map<int, CgiState>::iterator cgit = cgiStates.find(i);
+                                if (cgit != cgiStates.end()) {
+                                    if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
+                                    if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
+                                    kill(cgit->second.pid, SIGKILL);
+                                    waitpid(cgit->second.pid, NULL, WNOHANG);
+                                    cgiStates.erase(cgit);
+                                }
+                                
                                 close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
                                 clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
                                 sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
@@ -782,6 +910,16 @@ void Server::start() {
                 }
 
                 if (FD_ISSET(i, &write_fds)) {
+                    // Check if it's a CGI pipe (skip, already handled above)
+                    bool isCgiPipe = false;
+                    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
+                        if (i == cit->second.pipe_in) {
+                            isCgiPipe = true;
+                            break;
+                        }
+                    }
+                    if (isCgiPipe) continue;
+                    
                     std::map<int, std::string>::iterator cit = continueBuffers.find(i);
                     if (cit != continueBuffers.end()) {
                         const std::string& data = cit->second;
@@ -860,7 +998,10 @@ void Server::start() {
 }
 
 
-void Server::dispatchRequest(HttpRequest& request, HttpResponse& response, const ConfigParser::ServerConfig& config) {
+void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& response, 
+                              const ConfigParser::ServerConfig& config, bool& responseReady) {
+    responseReady = true; // Default: response is ready unless CGI
+    
     const LocationConfig& locConfig = findLocationConfig(config, request.getPath());
     std::string effectiveRoot = locConfig.getRoot().empty() ? config.root : locConfig.getRoot();
     std::string path = request.getPath();
@@ -910,11 +1051,21 @@ void Server::dispatchRequest(HttpRequest& request, HttpResponse& response, const
         }
     }
     
+    // Handle CGI requests
     if (isCgiRequest && (request.getMethod() == "POST" || request.getMethod() == "GET")) {
         std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot()
                                    : (!cgiLocPtr->getRoot().empty() ? cgiLocPtr->getRoot() : config.root);
-        handleCgiRequest(request, response, config, *cgiLocPtr, cgiEffectiveRoot);
-        return;
+        bool isHead = (request.getMethod() == "HEAD");
+        bool cgiStarted = startCgiRequest(clientFd, request, config, *cgiLocPtr, cgiEffectiveRoot, isHead);
+        if (cgiStarted) {
+            responseReady = false; // Response will be generated later when CGI completes
+            return;
+        } else {
+            // CGI failed to start
+            response.setStatus(500);
+            serveErrorPage(response, 500, config);
+            return;
+        }
     }
     
     std::set<std::string> allowedMethods = getAllowedMethodsForPath(request.getPath(), config);

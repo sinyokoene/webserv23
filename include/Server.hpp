@@ -31,6 +31,29 @@
 #include "HttpResponse.hpp"
 #include "LocationConfig.hpp"
 
+// Structure to track CGI state for non-blocking handling
+struct CgiState {
+    pid_t pid;
+    int pipe_in;  // Write to CGI stdin
+    int pipe_out; // Read from CGI stdout
+    std::string bodyToWrite;
+    size_t bodyWritten;
+    std::string cgiOutput;
+    bool writeComplete;
+    bool readComplete;
+    time_t startTime;
+    time_t lastIO;
+    HttpRequest request;
+    const ConfigParser::ServerConfig* config;
+    LocationConfig locConfig;
+    std::string effectiveRoot;
+    bool isHead;
+    
+    CgiState() : pid(0), pipe_in(-1), pipe_out(-1), bodyWritten(0), 
+                 writeComplete(false), readComplete(false), 
+                 startTime(0), lastIO(0), config(NULL), isHead(false) {}
+};
+
 class Server {
 public:
     Server(const std::string& configFile);
@@ -44,7 +67,8 @@ private:
     void serveErrorPage(HttpResponse& response, int statusCode, const ConfigParser::ServerConfig& config);
     std::set<std::string> getAllowedMethodsForPath(const std::string& path, const ConfigParser::ServerConfig& config) const;
 
-    void dispatchRequest(HttpRequest& request, HttpResponse& response, const ConfigParser::ServerConfig& config);
+    void dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& response, 
+                         const ConfigParser::ServerConfig& config, bool& responsReady);
     
     // Specific HTTP method handlers
     void handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
@@ -67,11 +91,17 @@ private:
     void handleOptionsRequest(HttpRequest& request, HttpResponse& response,
                               const ConfigParser::ServerConfig& config);
     
-    // CGI Handler
-    void handleCgiRequest(HttpRequest& request, HttpResponse& response,
-                          const ConfigParser::ServerConfig& config,
-                          const LocationConfig& locConfig,
-                          const std::string& effectiveRoot);
+    // CGI Handler (now non-blocking)
+    bool startCgiRequest(int clientFd, HttpRequest& request,
+                         const ConfigParser::ServerConfig& config,
+                         const LocationConfig& locConfig,
+                         const std::string& effectiveRoot,
+                         bool isHead);
+    
+    // CGI helpers for main loop
+    void handleCgiWrite(int clientFd, CgiState& cgi);
+    void handleCgiRead(int clientFd, CgiState& cgi);
+    void finalizeCgiRequest(int clientFd, CgiState& cgi, int status, std::string& responseBuffer);
                           
     // Utility
     std::string getMimeType(const std::string& path) const;
@@ -88,6 +118,9 @@ private:
     std::map<int, std::vector<const ConfigParser::ServerConfig*> > portToConfigs;
     // Mapping from server socket fd to port
     std::map<int, int> socketPortMap;
+    
+    // CGI state tracking (client fd -> CGI state)
+    std::map<int, CgiState> cgiStates;
 };
 
 #endif // SERVER_HPP
