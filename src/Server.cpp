@@ -1,6 +1,23 @@
 #include "Server.hpp"
 #include "Utils.hpp"
-#include <signal.h>
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <limits.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
 // Event loop tuning knobs
 static const int SELECT_TIMEOUT_SEC = 1;
@@ -234,8 +251,7 @@ void Server::acceptConnections(fd_set& master_read, int& fdmax,
                 socklen_t clientLen = sizeof(clientAddr);
                 int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
                 if (clientSocket < 0) {
-                    if (errno == EWOULDBLOCK || errno == EAGAIN) break;
-                    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+                    std::cerr << "Error accepting connection" << std::endl;
                     break;
                 }
                 int cflags = fcntl(clientSocket, F_GETFL, 0);
@@ -276,8 +292,10 @@ void Server::processCgiIo(fd_set& read_fds, fd_set& write_fds,
                     FD_SET(clientFd, &master_write);
                     if (clientFd > fdmax) fdmax = clientFd;
                 }
+                std::map<int, CgiState>::iterator next = cit;
+                ++next;
                 cleanupCgi(clientFd, cgiStates);
-                cit = cgiStates.begin();
+                cit = next;
                 continue;
             }
         }
@@ -291,7 +309,7 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
     for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
         int fd = it->first;
         ClientState& state = it->second;
-        bool restartClientsLoop = false;
+        bool closed = false;
 
         if (FD_ISSET(fd, &read_fds)) {
             char buffer[8192];
@@ -311,24 +329,19 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
                         break;
                     }
                 } else if (bytesRead == 0) {
+                    std::map<int, ClientState>::iterator next = it;
+                    ++next;
                     closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                    restartClientsLoop = true;
+                    it = next;
+                    closed = true;
                     break;
                 } else {
-                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                        break;
-                    }
-                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                    restartClientsLoop = true;
-                    break;
+                    break; // No bytes and no close; try again when selectable
                 }
             }
         }
 
-        if (restartClientsLoop) {
-            it = clients.begin();
-            continue;
-        }
+        if (closed) continue;
 
         bool parsed = true;
         while (parsed) {
@@ -461,7 +474,7 @@ void Server::processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set&
     for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
         int fd = it->first;
         ClientState& st = it->second;
-        bool restartClientsLoop = false;
+        bool closed = false;
 
         if (FD_ISSET(fd, &write_fds)) {
             while (st.outOffset < st.outBuffer.size()) {
@@ -469,15 +482,11 @@ void Server::processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set&
                 if (sent > 0) {
                     st.outOffset += sent;
                     st.lastActivity = now;
-                } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break;
                 } else {
-                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                    restartClientsLoop = true;
                     break;
                 }
             }
-            if (restartClientsLoop) { it = clients.begin(); continue; }
+            if (closed) continue;
 
             if (st.outOffset >= st.outBuffer.size()) {
                 st.outBuffer.clear();
@@ -494,27 +503,24 @@ void Server::processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set&
                     } else if (r == 0) {
                         clearFileStream(st.fileStream);
                     } else {
+                        std::map<int, ClientState>::iterator next = it;
+                        ++next;
                         closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                        restartClientsLoop = true;
+                        it = next;
+                        closed = true;
                     }
                 }
-                if (restartClientsLoop) { it = clients.begin(); continue; }
+                if (closed) continue;
 
                 while (!st.fileStream.pendingChunk.empty()) {
                     ssize_t sent = send(fd, st.fileStream.pendingChunk.c_str(), st.fileStream.pendingChunk.size(), 0);
                     if (sent > 0) {
                         st.fileStream.pendingChunk.erase(0, sent);
                         st.lastActivity = now;
-                    } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break;
                     } else {
-                        closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                        restartClientsLoop = true;
                         break;
                     }
                 }
-                if (restartClientsLoop) { it = clients.begin(); continue; }
-
                 if (st.fileStream.pendingChunk.empty() && st.fileStream.offset >= st.fileStream.size) {
                     clearFileStream(st.fileStream);
                 }
@@ -523,16 +529,16 @@ void Server::processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set&
             if (!needsWrite(st)) {
                 FD_CLR(fd, &master_write);
                 if (!st.keepAlive) {
+                    std::map<int, ClientState>::iterator next = it;
+                    ++next;
                     closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                    restartClientsLoop = true;
+                    it = next;
+                    closed = true;
                 }
             }
         }
 
-        if (restartClientsLoop) {
-            it = clients.begin();
-            continue;
-        }
+        if (closed) continue;
 
         ++it;
     }
@@ -586,19 +592,17 @@ void Server::parseConfig(const std::string& configFile) {
     }
 }
 
-const LocationConfig& Server::findLocationConfig(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const {
-    std::string bestMatchPath = "";
+std::pair<std::string, const LocationConfig*> Server::matchLocation(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const {
+    std::string bestMatchPath;
     const LocationConfig* bestMatchConfig = &serverConfig.defaultLocationSettings;
 
     for (std::map<std::string, LocationConfig>::const_iterator it = serverConfig.locations.begin(); it != serverConfig.locations.end(); ++it) {
         const std::string& locationPath = it->first;
         bool matches = false;
-        
-        
+
         if (path.find(locationPath) == 0) {
             matches = true;
-        }
-        else if (!locationPath.empty() && locationPath[locationPath.size() - 1] == '/') {
+        } else if (!locationPath.empty() && locationPath[locationPath.size() - 1] == '/') {
             std::string pathWithSlash = path;
             if (pathWithSlash.empty() || pathWithSlash[pathWithSlash.size() - 1] != '/') {
                 pathWithSlash += '/';
@@ -611,15 +615,17 @@ const LocationConfig& Server::findLocationConfig(const ConfigParser::ServerConfi
                 matches = true;
             }
         }
-        if (matches) {
-            if (locationPath.length() > bestMatchPath.length()) {
-                bestMatchPath = locationPath;
-                bestMatchConfig = &it->second;
-            }
+        if (matches && locationPath.length() > bestMatchPath.length()) {
+            bestMatchPath = locationPath;
+            bestMatchConfig = &it->second;
         }
     }
-    
-    return *bestMatchConfig;
+
+    return std::make_pair(bestMatchPath, bestMatchConfig);
+}
+
+const LocationConfig& Server::findLocationConfig(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const {
+    return *(matchLocation(serverConfig, path).second);
 }
 
 
@@ -636,26 +642,9 @@ std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const 
     std::string canonicalBasePath(realBasePath);
     std::string joinPath = relativePath;
     if (!relativePath.empty() && relativePath[0] == '/') {
-        
-        std::string bestMatchPath = "";
-        const LocationConfig* bestMatchConfig = &config.defaultLocationSettings;
-        for (std::map<std::string, LocationConfig>::const_iterator it = config.locations.begin(); it != config.locations.end(); ++it) {
-            const std::string& locationPath = it->first;
-            bool matches = false;
-            if (relativePath.find(locationPath) == 0) {
-                matches = true;
-            } else if (!locationPath.empty() && locationPath[locationPath.size() - 1] == '/') {
-                std::string uriWithSlash = relativePath;
-                if (uriWithSlash.empty() || uriWithSlash[uriWithSlash.size() - 1] != '/') uriWithSlash += '/';
-                if (uriWithSlash.find(locationPath) == 0) matches = true;
-            }
-            if (matches) {
-                if (locationPath.length() > bestMatchPath.length()) {
-                    bestMatchPath = locationPath;
-                    bestMatchConfig = &it->second;
-                }
-            }
-        }
+        std::pair<std::string, const LocationConfig*> match = matchLocation(config, relativePath);
+        const std::string& bestMatchPath = match.first;
+        const LocationConfig* bestMatchConfig = match.second;
         
         if (!bestMatchPath.empty()) {
             if (!bestMatchConfig->getRoot().empty()) {
@@ -801,8 +790,7 @@ void Server::start() {
             tv.tv_usec = 0;
             int nready = select(loopFdMax + 1, &read_fds, &write_fds, NULL, &tv);
             if (nready == -1) {
-                if (errno == EINTR) continue;
-                std::cerr << "Error in select(): " << strerror(errno) << std::endl;
+                std::cerr << "Error in select()" << std::endl;
                 break;
             }
 

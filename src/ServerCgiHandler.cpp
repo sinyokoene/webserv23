@@ -1,6 +1,15 @@
 #include "Server.hpp"
 #include "Utils.hpp"
 
+#include <cerrno>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 // Helper to convert HttpRequest to environment variables
 static std::vector<char*> createCgiEnv(HttpRequest& request,
                                        const ConfigParser::ServerConfig& config,
@@ -194,16 +203,8 @@ void Server::handleCgiWrite(int clientFd, CgiState& cgi) {
             cgi.writeComplete = true;
             std::cerr << "DEBUG[CGI]: Client " << clientFd << " stdin closed after " << cgi.bodyWritten << " bytes" << std::endl;
         }
-    } else if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // Not ready to write yet; try again when selectable
-        return;
     } else {
-        std::cerr << "Write to CGI stdin failed for client " << clientFd << std::endl;
-        if (cgi.pipe_in != -1) {
-            close(cgi.pipe_in);
-            cgi.pipe_in = -1;
-        }
-        cgi.writeComplete = true;
+        return; // Not ready; try again when selectable
     }
             }
             
@@ -222,16 +223,8 @@ void Server::handleCgiRead(int clientFd, CgiState& cgi) {
         cgi.pipe_out = -1;
         cgi.readComplete = true;
         std::cerr << "DEBUG[CGI]: Client " << clientFd << " stdout EOF, output=" << cgi.cgiOutput.size() << " bytes" << std::endl;
-    } else if (bytesRead < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // No data ready; try again later
-        return;
     } else if (bytesRead < 0) {
-        std::cerr << "Read from CGI stdout failed for client " << clientFd << std::endl;
-        if (cgi.pipe_out != -1) {
-            close(cgi.pipe_out);
-            cgi.pipe_out = -1;
-        }
-        cgi.readComplete = true;
+        return; // No data ready; try again later
     }
 }
 

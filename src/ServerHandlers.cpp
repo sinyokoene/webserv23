@@ -1,8 +1,10 @@
 #include "Server.hpp"
 #include "Utils.hpp"
-#include <sys/stat.h>
+
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static std::string extractFilenameFromContentDisposition(const std::string& headerValue) {
     // Try RFC5987 filename* first

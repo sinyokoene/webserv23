@@ -1,29 +1,15 @@
 #ifndef SERVER_HPP
 #define SERVER_HPP
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <netinet/in.h>
-#include <sys/select.h> // For fd_set
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include <sys/select.h> // fd_set
+#include <sys/types.h>  // pid_t, off_t
 
-#include <algorithm>
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime> // For time_t
-#include <fstream>
-#include <iostream>
+#include <cstddef>
+#include <ctime> // time_t
 #include <map>
 #include <set>
-#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ConfigParser.hpp"
@@ -106,6 +92,7 @@ public:
     
 private:
     void parseConfig(const std::string& configFile);
+    std::pair<std::string, const LocationConfig*> matchLocation(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const;
     const LocationConfig& findLocationConfig(const ConfigParser::ServerConfig& serverConfig, const std::string& path) const;
     std::string resolvePath(const ConfigParser::ServerConfig& config, const std::string& basePath, const std::string& relativePath) const;
     void serveErrorPage(HttpResponse& response, int statusCode, const ConfigParser::ServerConfig& config);

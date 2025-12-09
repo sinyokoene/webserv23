@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdlib>
 #include <limits.h>
+#include <signal.h>
 #include <unistd.h>
 
 static std::string canonicalPath(const std::string& path) {
