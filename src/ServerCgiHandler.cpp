@@ -174,10 +174,10 @@ bool Server::startCgiRequest(int clientFd, HttpRequest& request,
 
         std::cerr << "DEBUG[CGI]: Started pid=" << pid << " for client " << clientFd << std::endl;
         return true;
-    }
+                }
     return false;
-}
-
+            }
+            
 // Handle writing to CGI stdin
 void Server::handleCgiWrite(int clientFd, CgiState& cgi) {
     if (cgi.writeComplete) return;
@@ -194,16 +194,19 @@ void Server::handleCgiWrite(int clientFd, CgiState& cgi) {
             cgi.writeComplete = true;
             std::cerr << "DEBUG[CGI]: Client " << clientFd << " stdin closed after " << cgi.bodyWritten << " bytes" << std::endl;
         }
-    } else if (written == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        std::cerr << "Write to CGI stdin failed for client " << clientFd << ": " << strerror(errno) << std::endl;
+    } else if (written == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // Not ready to write yet; try again when selectable
+        return;
+    } else {
+        std::cerr << "Write to CGI stdin failed for client " << clientFd << std::endl;
         if (cgi.pipe_in != -1) {
             close(cgi.pipe_in);
             cgi.pipe_in = -1;
         }
         cgi.writeComplete = true;
     }
-}
-
+            }
+            
 // Handle reading from CGI stdout
 void Server::handleCgiRead(int clientFd, CgiState& cgi) {
     if (cgi.readComplete) return;
@@ -219,8 +222,11 @@ void Server::handleCgiRead(int clientFd, CgiState& cgi) {
         cgi.pipe_out = -1;
         cgi.readComplete = true;
         std::cerr << "DEBUG[CGI]: Client " << clientFd << " stdout EOF, output=" << cgi.cgiOutput.size() << " bytes" << std::endl;
-    } else if (bytesRead == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-        std::cerr << "Read from CGI stdout failed for client " << clientFd << ": " << strerror(errno) << std::endl;
+    } else if (bytesRead < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // No data ready; try again later
+        return;
+    } else if (bytesRead < 0) {
+        std::cerr << "Read from CGI stdout failed for client " << clientFd << std::endl;
         if (cgi.pipe_out != -1) {
             close(cgi.pipe_out);
             cgi.pipe_out = -1;
@@ -247,7 +253,7 @@ void Server::finalizeCgiRequest(int clientFd, CgiState& cgi, int status, std::st
 
     HttpResponse response;
 
-    if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS) {
         // Parse CGI output
         size_t headerEndPos = cgi.cgiOutput.find("\r\n\r\n");
         if (headerEndPos == std::string::npos) {
@@ -256,56 +262,56 @@ void Server::finalizeCgiRequest(int clientFd, CgiState& cgi, int status, std::st
                 std::cerr << "CGI output format error for client " << clientFd << std::endl;
                 serveErrorPage(response, 500, *cgi.config);
                 responseBuffer = response.generateResponse(cgi.isHead);
-                return;
-            }
+                    return;
+                }
             headerEndPos += 2;
-        } else {
+            } else {
             headerEndPos += 4;
-        }
+            }
 
         std::string cgiHeadersStr = cgi.cgiOutput.substr(0, headerEndPos);
         std::string cgiBodyStr = cgi.cgiOutput.substr(headerEndPos);
 
-        response.setStatus(200);
+            response.setStatus(200);
 
-        std::istringstream headerStream(cgiHeadersStr);
-        std::string headerLine;
-        bool contentTypeSet = false;
-        while (std::getline(headerStream, headerLine)) {
-            if (headerLine.empty() || headerLine == "\r") continue;
-            if (!headerLine.empty() && headerLine[headerLine.length() - 1] == '\r') {
-                headerLine.erase(headerLine.length() - 1);
-            }
-
-            size_t colonPos = headerLine.find(':');
-            if (colonPos != std::string::npos) {
-                std::string headerName = headerLine.substr(0, colonPos);
-                std::string headerValue = headerLine.substr(colonPos + 1);
-                size_t first = headerValue.find_first_not_of(" \t");
-                if (std::string::npos == first) headerValue = ""; else {
-                    size_t last = headerValue.find_last_not_of(" \t");
-                    headerValue = headerValue.substr(first, (last - first + 1));
+            std::istringstream headerStream(cgiHeadersStr);
+            std::string headerLine;
+            bool contentTypeSet = false;
+            while (std::getline(headerStream, headerLine)) {
+                if (headerLine.empty() || headerLine == "\r") continue;
+                if (!headerLine.empty() && headerLine[headerLine.length() - 1] == '\r') {
+                    headerLine.erase(headerLine.length() - 1);
                 }
-                if (headerName == "Status") {
-                    std::istringstream statusVal(headerValue);
-                    int statusCode; statusVal >> statusCode;
-                    response.setStatus(statusCode);
-                } else {
-                    response.setHeader(headerName, headerValue);
-                    if (headerName == "Content-Type") contentTypeSet = true;
+
+                size_t colonPos = headerLine.find(':');
+                if (colonPos != std::string::npos) {
+                    std::string headerName = headerLine.substr(0, colonPos);
+                    std::string headerValue = headerLine.substr(colonPos + 1);
+                    size_t first = headerValue.find_first_not_of(" \t");
+                    if (std::string::npos == first) headerValue = ""; else {
+                        size_t last = headerValue.find_last_not_of(" \t");
+                        headerValue = headerValue.substr(first, (last - first + 1));
+                    }
+                    if (headerName == "Status") {
+                        std::istringstream statusVal(headerValue);
+                        int statusCode; statusVal >> statusCode;
+                        response.setStatus(statusCode);
+                    } else {
+                        response.setHeader(headerName, headerValue);
+                        if (headerName == "Content-Type") contentTypeSet = true;
+                    }
                 }
             }
-        }
-        if (!contentTypeSet) response.setHeader("Content-Type", "text/html");
-        response.setBody(cgiBodyStr);
+            if (!contentTypeSet) response.setHeader("Content-Type", "text/html");
+            response.setBody(cgiBodyStr);
 
-    } else {
+        } else {
         std::cerr << "CGI script execution failed for client " << clientFd << std::endl;
         if (WIFSIGNALED(status)) {
             std::cerr << "CGI killed by signal: " << WTERMSIG(status) << std::endl;
-        }
+            }
         serveErrorPage(response, 502, *cgi.config);
-    }
+        }
 
     responseBuffer = response.generateResponse(cgi.isHead);
 }

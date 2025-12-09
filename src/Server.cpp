@@ -2,23 +2,108 @@
 #include "Utils.hpp"
 #include <signal.h>
 
+// ---- internal helpers ----------------------------------------------------
+static std::map<std::string, std::string> parseHeaderMap(const std::string& headerBlock) {
+    std::map<std::string, std::string> headers;
+    std::istringstream hs(headerBlock);
+    std::string line;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string name = toLower(line.substr(0, colon));
+        std::string value = line.substr(colon + 1);
+        size_t first = value.find_first_not_of(" \t");
+        size_t last = value.find_last_not_of(" \t");
+        if (first != std::string::npos) value = value.substr(first, last - first + 1); else value = "";
+        headers[name] = value;
+    }
+    return headers;
+}
+
+static bool needsWrite(const ClientState& st) {
+    if (st.outOffset < st.outBuffer.size()) return true;
+    if (st.fileStream.active) {
+        if (!st.fileStream.pendingChunk.empty()) return true;
+        if (st.fileStream.offset < st.fileStream.size) return true;
+    }
+    return false;
+}
+
+static void clearFileStream(FileStreamState& fs) {
+    if (fs.fd != -1) close(fs.fd);
+    fs.fd = -1;
+    fs.offset = 0;
+    fs.size = 0;
+    fs.active = false;
+    fs.isHead = false;
+    fs.pendingChunk.clear();
+}
+
+static bool decodeChunkedBody(const std::string& data, size_t startPos, size_t& consumed, std::string& out) {
+    size_t pos = startPos;
+    out.clear();
+    while (true) {
+        size_t lineEnd = data.find("\r\n", pos);
+        if (lineEnd == std::string::npos) return false;
+        std::string sizeLine = data.substr(pos, lineEnd - pos);
+        size_t sc = sizeLine.find(';');
+        if (sc != std::string::npos) sizeLine = sizeLine.substr(0, sc);
+        size_t f = sizeLine.find_first_not_of(" \t");
+        size_t l = sizeLine.find_last_not_of(" \t");
+        if (f == std::string::npos) return false;
+        sizeLine = sizeLine.substr(f, l - f + 1);
+        unsigned long chunkSize = 0;
+        std::istringstream xs(sizeLine);
+        xs >> std::hex >> chunkSize;
+        if (xs.fail()) return false;
+        pos = lineEnd + 2;
+        if (chunkSize == 0) {
+            size_t trailerEnd = data.find("\r\n", pos);
+            if (trailerEnd == std::string::npos) return false;
+            consumed = trailerEnd + 2;
+            return true;
+        }
+        if (data.size() < pos + chunkSize + 2) return false;
+        out.append(data, pos, chunkSize);
+        pos += chunkSize;
+        if (!(data[pos] == '\r' && data[pos + 1] == '\n')) return false;
+        pos += 2;
+    }
+}
+
+static void cleanupCgi(int fd, std::map<int, CgiState>& cgiStates) {
+    std::map<int, CgiState>::iterator cgit = cgiStates.find(fd);
+    if (cgit != cgiStates.end()) {
+        if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
+        if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
+        kill(cgit->second.pid, SIGKILL);
+        waitpid(cgit->second.pid, NULL, WNOHANG);
+        cgiStates.erase(cgit);
+    }
+}
+
+static void closeClientFd(int fd, fd_set& mr, fd_set& mw, std::map<int, ClientState>& clients, std::map<int, CgiState>& cgiStates) {
+    cleanupCgi(fd, cgiStates);
+    std::map<int, ClientState>::iterator it = clients.find(fd);
+    if (it != clients.end()) {
+        clearFileStream(it->second.fileStream);
+        clients.erase(it);
+    }
+    close(fd);
+    FD_CLR(fd, &mr);
+    FD_CLR(fd, &mw);
+}
+
+// ---- end helpers ---------------------------------------------------------
+
 Server::Server(const std::string& configFile) {
     configPath = configFile;
     parseConfig(configFile);
-    if (!serverConfigs.empty()) {
-        currentConfig = serverConfigs[0];
-        
-    } else {
-        std::cerr << "Error: No server configurations loaded. Using hardcoded emergency defaults." << std::endl;
-        currentConfig.listenPorts.push_back("8080");
-        currentConfig.root = "./www";
-        currentConfig.defaultLocationSettings.setRoot(currentConfig.root);
-        std::vector<std::string> defaultMethods;
-        defaultMethods.push_back("GET");
-        defaultMethods.push_back("HEAD");
-        currentConfig.defaultLocationSettings.setMethods(defaultMethods);
-        currentConfig.clientMaxBodySize = 1024 * 1024;
+    if (serverConfigs.empty()) {
+        throw std::runtime_error("No server configurations loaded.");
     }
+    currentConfig = serverConfigs[0];
 }
 
 
@@ -124,6 +209,16 @@ std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const 
                 joinPath = sub;
             }
         }
+
+        // If the matched location path is an exact file (no trailing slash) and there is
+        // no remaining subpath, use the request path (without the leading slash) so we
+        // resolve to the file instead of the directory root.
+        if (joinPath.empty() &&
+            !bestMatchPath.empty() &&
+            bestMatchPath == relativePath &&
+            bestMatchPath[bestMatchPath.size() - 1] != '/') {
+            joinPath = relativePath.substr(1);
+        }
     }
 
     std::string fullPath = canonicalBasePath;
@@ -150,7 +245,6 @@ std::string Server::resolvePath(const ConfigParser::ServerConfig& config, const 
 }
 
 void Server::serveErrorPage(HttpResponse& response, int statusCode, const ConfigParser::ServerConfig& config) {
-    response.setHeader("Access-Control-Allow-Origin", "*");
     std::map<int, std::string>::const_iterator it = config.errorPages.find(statusCode);
     std::string errorPagePath;
     if (it != config.errorPages.end()) {
@@ -166,8 +260,6 @@ void Server::serveErrorPage(HttpResponse& response, int statusCode, const Config
             errFile.close();
             response.setStatus(statusCode);
             return;
-        } else {
-            std::cerr << "Warning: Custom error page for " << statusCode << " defined at '" << it->second << "' (resolved to '" << errorPagePath << "') but could not be opened." << std::endl;
         }
     }
     response.setStatus(statusCode);
@@ -221,25 +313,28 @@ const ConfigParser::ServerConfig& Server::selectConfig(int port, const std::stri
 }
 
 void Server::start() {
-    try {
-        std::ofstream logFile("server.log");
-        if (logFile.is_open()) {
-            logFile << "Attempting to start server with config: " << configPath << std::endl;
-        }
+    const int SELECT_TIMEOUT_SEC = 1;
+    const int CLIENT_TIMEOUT_SEC = 30;
+    const int CGI_TIMEOUT_SEC = 120;
+    const size_t MAX_HEADER_BYTES = 32 * 1024;
+    const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024;
+    const size_t FILE_CHUNK_BYTES = 16 * 1024;
 
+    std::map<int, ClientState> clients;
+
+    try {
         // 1. Populate portToConfigs map and identify unique ports
         std::set<int> portsToBind;
         portToConfigs.clear();
 
         if (serverConfigs.empty()) {
-            // Fallback to currentConfig (emergency default) if no configs parsed
-        for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
-            it != currentConfig.listenPorts.end(); ++it) {
-            int port = atoi(it->c_str());
-                 if (port > 0 && port <= 65535) {
-                     portsToBind.insert(port);
-                     portToConfigs[port].push_back(&currentConfig);
-                 }
+            for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
+                 it != currentConfig.listenPorts.end(); ++it) {
+                int port = atoi(it->c_str());
+                if (port > 0 && port <= 65535) {
+                    portsToBind.insert(port);
+                    portToConfigs[port].push_back(&currentConfig);
+                }
             }
         } else {
             for (size_t i = 0; i < serverConfigs.size(); ++i) {
@@ -266,7 +361,7 @@ void Server::start() {
                 std::cerr << "Error creating socket for port " << port << ": " << strerror(errno) << std::endl;
                 continue;
             }
-            
+
             int flags = fcntl(serverSocket, F_GETFL, 0);
             if (flags != -1) fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
 
@@ -297,20 +392,15 @@ void Server::start() {
 
             serverSockets.push_back(serverSocket);
             socketPortMap[serverSocket] = port;
-
-            if (logFile.is_open()) {
-                logFile << "Server is listening on port " << port << std::endl;
-            }
             std::cout << "Server is listening on port " << port << std::endl;
         }
 
         if (serverSockets.empty()) {
             std::cerr << "Failed to set up any server sockets. Exiting." << std::endl;
-            if (logFile.is_open()) { logFile << "Failed to set up any server sockets. Exiting." << std::endl; logFile.close(); }
             return;
         }
 
-        fd_set master_read, master_write, read_fds, write_fds;
+        fd_set master_read, master_write;
         FD_ZERO(&master_read);
         FD_ZERO(&master_write);
         int fdmax = 0;
@@ -320,53 +410,28 @@ void Server::start() {
             if (*it > fdmax) fdmax = *it;
         }
 
-        std::map<int, std::string> clientBuffers;     
-        std::map<int, std::string> responseBuffers;   
-        std::map<int, size_t> sendOffsets;            
-        std::map<int, bool> keepAliveMap;             
-        std::map<int, time_t> lastActivity;           
-        std::map<int, bool> sentContinueMap;          
-        std::map<int, std::string> continueBuffers;   
-        std::map<int, size_t> continueOffsets;        
-        std::map<int, bool> chunkedInited;            
-        std::map<int, size_t> chunkedPos;             
-        std::map<int, std::string> chunkedDecoded;    
-        std::map<int, std::string> chunkedReqLine;    
-        std::map<int, std::string> chunkedNewHeaders; 
-        std::map<int, bool> chunkedComplete;          
-        std::map<int, size_t> chunkedConsumedEnd;     
-        std::map<int, int> clientPortMap; // Map client fd to server port
-
         std::cout << "Server is running. Press Ctrl+C to stop." << std::endl;
 
-        const int SELECT_TIMEOUT_SEC = 1;      
-        const int CLIENT_TIMEOUT_SEC = 30;     
-        const size_t MAX_HEADER_BYTES = 32 * 1024;     
-        const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024; 
-
         while (true) {
-            read_fds = master_read;
-            write_fds = master_write;
+            fd_set read_fds = master_read;
+            fd_set write_fds = master_write;
+            int loopFdMax = fdmax;
 
-            // Add CGI pipes to fdsets
             for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
-                CgiState& cgi = cit->second;
-                
-                // Add CGI stdout to read set if still reading
-                if (cgi.pipe_out != -1 && !cgi.readComplete) {
-                    FD_SET(cgi.pipe_out, &read_fds);
-                    if (cgi.pipe_out > fdmax) fdmax = cgi.pipe_out;
+                if (cit->second.pipe_out != -1 && !cit->second.readComplete) {
+                    FD_SET(cit->second.pipe_out, &read_fds);
+                    if (cit->second.pipe_out > loopFdMax) loopFdMax = cit->second.pipe_out;
                 }
-                
-                // Add CGI stdin to write set if still writing
-                if (cgi.pipe_in != -1 && !cgi.writeComplete) {
-                    FD_SET(cgi.pipe_in, &write_fds);
-                    if (cgi.pipe_in > fdmax) fdmax = cgi.pipe_in;
+                if (cit->second.pipe_in != -1 && !cit->second.writeComplete) {
+                    FD_SET(cit->second.pipe_in, &write_fds);
+                    if (cit->second.pipe_in > loopFdMax) loopFdMax = cit->second.pipe_in;
                 }
             }
 
-            struct timeval tv; tv.tv_sec = SELECT_TIMEOUT_SEC; tv.tv_usec = 0;
-            int nready = select(fdmax + 1, &read_fds, &write_fds, NULL, &tv);
+            struct timeval tv;
+            tv.tv_sec = SELECT_TIMEOUT_SEC;
+            tv.tv_usec = 0;
+            int nready = select(loopFdMax + 1, &read_fds, &write_fds, NULL, &tv);
             if (nready == -1) {
                 if (errno == EINTR) continue;
                 std::cerr << "Error in select(): " << strerror(errno) << std::endl;
@@ -375,622 +440,347 @@ void Server::start() {
 
             time_t now = time(NULL);
 
-            for (std::map<int, time_t>::iterator it = lastActivity.begin(); it != lastActivity.end(); ) {
-                int fd = it->first; time_t last = it->second;
-                if (now - last > CLIENT_TIMEOUT_SEC) {
-                    // Clean up CGI if active
-                    std::map<int, CgiState>::iterator cgit = cgiStates.find(fd);
-                    if (cgit != cgiStates.end()) {
-                        if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
-                        if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
-                        kill(cgit->second.pid, SIGKILL);
-                        waitpid(cgit->second.pid, NULL, WNOHANG);
-                        cgiStates.erase(cgit);
-                    }
-                    
-                    close(fd);
-                    FD_CLR(fd, &master_read);
-                    FD_CLR(fd, &master_write);
-                    clientBuffers.erase(fd);
-                    responseBuffers.erase(fd);
-                    sendOffsets.erase(fd);
-                    keepAliveMap.erase(fd);
-                    sentContinueMap.erase(fd);
-                    continueBuffers.erase(fd);
-                    continueOffsets.erase(fd);
-                    chunkedInited.erase(fd);
-                    chunkedPos.erase(fd);
-                    chunkedDecoded.erase(fd);
-                    chunkedReqLine.erase(fd);
-                    chunkedNewHeaders.erase(fd);
-                    chunkedComplete.erase(fd);
-                    chunkedConsumedEnd.erase(fd);
-                    clientPortMap.erase(fd);
-                    lastActivity.erase(it++); 
+            // Client timeouts
+            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+                if (now - it->second.lastActivity > CLIENT_TIMEOUT_SEC) {
+                    closeClientFd(it->first, master_read, master_write, clients, cgiStates);
+                    it = clients.begin(); // iterator invalidated, restart
                 } else {
                     ++it;
                 }
             }
 
-            // Handle CGI I/O and completion
+            // CGI timeouts
+            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
+                if (now - cit->second.lastIO > CGI_TIMEOUT_SEC) {
+                    HttpResponse response;
+                    serveErrorPage(response, 504, *cit->second.config);
+                    int clientFd = cit->first;
+                    if (clients.find(clientFd) != clients.end()) {
+                        clients[clientFd].outBuffer = response.generateResponse(cit->second.isHead);
+                        clients[clientFd].outOffset = 0;
+                        FD_SET(clientFd, &master_write);
+                        if (clientFd > fdmax) fdmax = clientFd;
+                    }
+                    cleanupCgi(clientFd, cgiStates);
+                    cit = cgiStates.begin();
+                } else {
+                    ++cit;
+                }
+            }
+
+            // Accept new connections
+            for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
+                if (FD_ISSET(*it, &read_fds)) {
+                    while (true) {
+                        struct sockaddr_in clientAddr;
+                        socklen_t clientLen = sizeof(clientAddr);
+                        int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
+                        if (clientSocket < 0) {
+                            if (errno == EWOULDBLOCK || errno == EAGAIN) break;
+                            std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+                            break;
+                        }
+                        int cflags = fcntl(clientSocket, F_GETFL, 0);
+                        if (cflags != -1) fcntl(clientSocket, F_SETFL, cflags | O_NONBLOCK);
+                        FD_SET(clientSocket, &master_read);
+                        if (clientSocket > fdmax) fdmax = clientSocket;
+                        ClientState cs;
+                        cs.lastActivity = now;
+                        cs.port = socketPortMap[*it];
+                        clients[clientSocket] = cs;
+                    }
+                }
+            }
+
+            // CGI I/O
             for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
                 CgiState& cgi = cit->second;
                 int clientFd = cit->first;
-                
-                // Check CGI timeout
-                if (now - cgi.lastIO > 120) { // 120 second timeout
-                    std::cerr << "CGI timeout for client " << clientFd << std::endl;
-                    if (cgi.pipe_in != -1) { close(cgi.pipe_in); cgi.pipe_in = -1; }
-                    if (cgi.pipe_out != -1) { close(cgi.pipe_out); cgi.pipe_out = -1; }
-                    kill(cgi.pid, SIGKILL);
-                    waitpid(cgi.pid, NULL, WNOHANG);
-                    
-                    HttpResponse response;
-                    serveErrorPage(response, 504, *cgi.config);
-                    responseBuffers[clientFd] = response.generateResponse(cgi.isHead);
-                    sendOffsets[clientFd] = 0;
-                    FD_SET(clientFd, &master_write);
-                    cgiStates.erase(cit++);
-                    continue;
-                }
-                
-                // Handle CGI writes
                 if (cgi.pipe_in != -1 && FD_ISSET(cgi.pipe_in, &write_fds)) {
                     handleCgiWrite(clientFd, cgi);
                 }
-                
-                // Handle CGI reads
                 if (cgi.pipe_out != -1 && FD_ISSET(cgi.pipe_out, &read_fds)) {
                     handleCgiRead(clientFd, cgi);
                 }
-                
-                // Check if CGI is complete
                 if (cgi.readComplete) {
                     int status;
                     pid_t result = waitpid(cgi.pid, &status, WNOHANG);
-                    if (result > 0) {  // Process exited
+                    if (result != 0) {
                         std::string response;
                         finalizeCgiRequest(clientFd, cgi, status, response);
-                        responseBuffers[clientFd] = response;
-                        sendOffsets[clientFd] = 0;
-                        FD_SET(clientFd, &master_write);
-                        cgiStates.erase(cit++);
-                        continue;
-                    } else if (result < 0) {
-                        std::cerr << "DEBUG[CGI]: Client " << clientFd << " waitpid error: " << strerror(errno) << std::endl;
-                        HttpResponse errResp;
-                        serveErrorPage(errResp, 500, *cgi.config);
-                        responseBuffers[clientFd] = errResp.generateResponse(cgi.isHead);
-                        sendOffsets[clientFd] = 0;
-                        FD_SET(clientFd, &master_write);
-                        cgiStates.erase(cit++);
+                        if (clients.find(clientFd) != clients.end()) {
+                            clients[clientFd].outBuffer = response;
+                            clients[clientFd].outOffset = 0;
+                            clients[clientFd].keepAlive = false;
+                            FD_SET(clientFd, &master_write);
+                            if (clientFd > fdmax) fdmax = clientFd;
+                        }
+                        cleanupCgi(clientFd, cgiStates);
+                        cit = cgiStates.begin();
                         continue;
                     }
-                    // else result == 0: process still running, wait longer
                 }
-                
                 ++cit;
             }
 
-            for (int i = 0; i <= fdmax; ++i) {
-                if (FD_ISSET(i, &read_fds)) {
-                    
-                    // Check if it's a CGI pipe (skip, already handled above)
-                    bool isCgiPipe = false;
-                    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
-                        if (i == cit->second.pipe_out) {
-                            isCgiPipe = true;
-                            break;
-                        }
-                    }
-                    if (isCgiPipe) continue;
-                    
-                    // Check if it's a server socket
-                    bool isServerSocket = false;
-                    for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
-                        if (i == *it) { isServerSocket = true; break; }
-                    }
-                    if (isServerSocket) {
-                        
-                        while (true) {
-                            struct sockaddr_in clientAddr; socklen_t clientLen = sizeof(clientAddr);
-                            int clientSocket = accept(i, (struct sockaddr*)&clientAddr, &clientLen);
-                            if (clientSocket < 0) {
-                                if (errno == EWOULDBLOCK || errno == EAGAIN) break;
-                                std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
-                                break;
-                            }
-                            
-                            int cflags = fcntl(clientSocket, F_GETFL, 0); if (cflags != -1) fcntl(clientSocket, F_SETFL, cflags | O_NONBLOCK);
+            // Read from clients
+            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+                int fd = it->first;
+                ClientState& state = it->second;
+                bool restartClientsLoop = false;
 
-                            FD_SET(clientSocket, &master_read);
-                            if (clientSocket > fdmax) fdmax = clientSocket;
-                            clientBuffers[clientSocket] = "";
-                            responseBuffers[clientSocket] = "";
-                            sendOffsets[clientSocket] = 0;
-                            keepAliveMap[clientSocket] = false;
-                            lastActivity[clientSocket] = now;
-                            sentContinueMap[clientSocket] = false;
-                            
-                            // Record which port this client connected to
-                            clientPortMap[clientSocket] = socketPortMap[i];
-                        }
-                        continue;
-                    }
-
-                    // Ensure this is actually a client socket (has buffer entry)
-                    if (clientBuffers.find(i) == clientBuffers.end()) {
-                        continue; // Not a client socket, skip
-                    }
-
+                if (FD_ISSET(fd, &read_fds)) {
                     char buffer[8192];
                     while (true) {
-                        ssize_t bytesRead = recv(i, buffer, sizeof(buffer), 0);
+                        ssize_t bytesRead = recv(fd, buffer, sizeof(buffer), 0);
                         if (bytesRead > 0) {
-                            clientBuffers[i].append(buffer, bytesRead);
-                            lastActivity[i] = now;
-                            
-                            // Select config early for error page checks
-                            int port = clientPortMap[i];
-                            const ConfigParser::ServerConfig& tempConfig = selectConfig(port, ""); // Default to first config for port
-
-                            if (clientBuffers[i].size() > MAX_REQUEST_BYTES) {
-                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, tempConfig); resp.setHeader("Connection", "close");
-                                keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
-                                clientBuffers[i].clear();
-                                goto next_fd;
-                            }
-                            
-                            size_t headerEnd = clientBuffers[i].find("\r\n\r\n");
-                            size_t sepLen = 4;
-                            if (headerEnd == std::string::npos) {
-                                headerEnd = clientBuffers[i].find("\n\n");
-                                sepLen = 2;
-                            }
-
-                            if (headerEnd != std::string::npos) {
-                                size_t bodyStart = headerEnd + sepLen;
-                                size_t contentLength = 0;
-                                bool hasContentLength = false;
-                                bool isChunked = false;
-                                bool expectContinue = false; 
-                                size_t consumedEndForErase = 0; 
-                                std::string normalizedRequestForParse; 
-                                std::string hostHeaderVal = "";
-
-                                {
-                                    const std::string headersPart = clientBuffers[i].substr(0, headerEnd);
-                                    std::istringstream hs(headersPart);
-                                    std::string line;
-                                    std::string connectionHeaderVal;
-                                    std::string firstLine;
-                                    {
-                                        size_t reqLineEndDbg = clientBuffers[i].find("\r\n");
-                                        if (reqLineEndDbg == std::string::npos) reqLineEndDbg = clientBuffers[i].find("\n");
-                                        if (reqLineEndDbg != std::string::npos) firstLine = clientBuffers[i].substr(0, reqLineEndDbg);
-                                    }
-                                    while (std::getline(hs, line)) {
-                                        if (!line.empty() && line[line.size()-1] == '\r') line.erase(line.size()-1);
-                                        size_t colon = line.find(':');
-                                        if (colon == std::string::npos) continue;
-                                        std::string name = line.substr(0, colon);
-                                        
-                                        for (size_t k = 0; k < name.size(); ++k) {
-                                            char c = name[k]; if (c >= 'A' && c <= 'Z') name[k] = c + 32;
-                                        }
-                                        std::string value = line.substr(colon + 1);
-                                        
-                                        size_t first = value.find_first_not_of(" \t");
-                                        size_t last = value.find_last_not_of(" \t");
-                                        if (first != std::string::npos) value = value.substr(first, last - first + 1); else value = "";
-
-                                        if (name == "content-length") {
-                                            std::istringstream iss(value); size_t tmp = 0; iss >> tmp; contentLength = tmp; hasContentLength = true;
-                                        } else if (name == "transfer-encoding") {
-                                            std::string lowerVal = value;
-                                            for (size_t k = 0; k < lowerVal.size(); ++k) { char c = lowerVal[k]; if (c >= 'A' && c <= 'Z') lowerVal[k] = c + 32; }
-                                            if (lowerVal.find("chunked") != std::string::npos) {
-                                                isChunked = true;
-                                            }
-                                        } else if (name == "connection") {
-                                            connectionHeaderVal = value;
-                                        } else if (name == "expect") {
-                                            std::string lowerVal = value; for (size_t k = 0; k < lowerVal.size(); ++k) { char c = lowerVal[k]; if (c >= 'A' && c <= 'Z') lowerVal[k] = c + 32; }
-                                            if (lowerVal.find("100-continue") != std::string::npos) {
-                                                expectContinue = true;
-                                            }
-                                        } else if (name == "host") {
-                                            hostHeaderVal = value;
-                                        }
-                                    }
-                                    {
-                                        std::string methodDbg = ""; std::string uriDbg = "";
-                                        size_t sp1 = firstLine.find(' ');
-                                        size_t sp2 = (sp1 != std::string::npos) ? firstLine.find(' ', sp1 + 1) : std::string::npos;
-                                        if (sp1 != std::string::npos && sp2 != std::string::npos) {
-                                            methodDbg = firstLine.substr(0, sp1);
-                                            uriDbg = firstLine.substr(sp1 + 1, sp2 - (sp1 + 1));
-                                        }
-                                        std::ofstream lf("server.log", std::ios::app);
-                                        if (lf.is_open()) {
-                                            // Look up config to log correct max body size
-                                            const ConfigParser::ServerConfig& dbgConfig = selectConfig(port, hostHeaderVal);
-                                            lf << "Headers: method=" << methodDbg
-                                               << " uri=" << uriDbg
-                                               << " hasCL=" << (hasContentLength?"1":"0")
-                                               << " CL=" << contentLength
-                                               << " chunked=" << (isChunked?"1":"0")
-                                               << " expect100=" << (expectContinue?"1":"0")
-                                               << " max=" << dbgConfig.clientMaxBodySize
-                                               << " host=" << hostHeaderVal
-                                               << std::endl;
-                                        }
-                                    }
-                                }
-                                
-                                // Select the correct config based on port and Host header
-                                const ConfigParser::ServerConfig& requestConfig = selectConfig(port, hostHeaderVal);
-
-                                bool handledEarly = false;
-                                {
-                                    size_t reqLineEnd = clientBuffers[i].find("\r\n");
-                                    if (reqLineEnd != std::string::npos) {
-                                        std::string requestLine = clientBuffers[i].substr(0, reqLineEnd);
-                                        size_t sp1 = requestLine.find(' ');
-                                        size_t sp2 = (sp1 != std::string::npos) ? requestLine.find(' ', sp1 + 1) : std::string::npos;
-                                        if (sp1 != std::string::npos && sp2 != std::string::npos) {
-                                            std::string method = requestLine.substr(0, sp1);
-                                            std::string uri = requestLine.substr(sp1 + 1, sp2 - (sp1 + 1));
-
-                                            bool endsWithBlaUri = uri.size() >= 4 && uri.compare(uri.size()-4, 4, ".bla") == 0;
-                                            const LocationConfig& earlyLoc = findLocationConfig(requestConfig, uri);
-                                            bool hasCgiPass = !earlyLoc.getCgiPass().empty();
-                                            bool isPotentialCgi = (uri.find("/cgi-bin/") != std::string::npos) ||
-                                                                  (uri.find(".php") != std::string::npos) ||
-                                                                  (uri.find(".py") != std::string::npos) ||
-                                                                  (uri.find(".cgi") != std::string::npos) ||
-                                                                  hasCgiPass ||
-                                                                  (endsWithBlaUri && method == "POST");
-                                            bool isPostBodySpecial = (method == "POST" && uri.find("/post_body") == 0);
-
-                                            if (!isPotentialCgi && !isPostBodySpecial) {
-                                                std::set<std::string> allowed = getAllowedMethodsForPath(uri, requestConfig);
-                                                if (allowed.find(method) == allowed.end()) {
-                                                    HttpResponse resp;
-                                                    resp.setStatus(405);
-                                                    
-                                                    std::string allowHeader = ""; for (std::set<std::string>::const_iterator it = allowed.begin(); it != allowed.end(); ++it) { if (it != allowed.begin()) allowHeader += ", "; allowHeader += *it; }
-                                                    resp.setHeader("Allow", allowHeader);
-                                                    serveErrorPage(resp, 405, requestConfig);
-                                                    resp.setHeader("Connection", "close");
-                                                    keepAliveMap[i] = false;
-                                                    responseBuffers[i] = resp.generateResponse(method == "HEAD");
-                                                    sendOffsets[i] = 0;
-                                                    FD_SET(i, &master_write);
-                                                    size_t consumed = headerEnd + sepLen;
-                                                    if (clientBuffers[i].size() > consumed) clientBuffers[i].erase(0, consumed); else clientBuffers[i].clear();
-                                                    handledEarly = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if (handledEarly) {
-                                    goto next_fd;
-                                } else {
-                                    if (hasContentLength && requestConfig.clientMaxBodySize > 0 && (long)contentLength > requestConfig.clientMaxBodySize) {
-                                        std::cerr << "DEBUG: Rejecting request with Content-Length=" << contentLength
-                                                  << " exceeding client_max_body_size=" << requestConfig.clientMaxBodySize << std::endl;
-                                        {
-                                            std::ofstream logFile("server.log", std::ios::app);
-                                            if (logFile.is_open()) {
-                                                logFile << "413 early reject: Content-Length " << contentLength
-                                                       << " > max " << requestConfig.clientMaxBodySize << std::endl;
-                                            }
-                                        }
-                                        HttpResponse resp;
-                                        resp.setStatus(413);
-                                        serveErrorPage(resp, 413, requestConfig);
-                                        resp.setHeader("Connection", "close");
-                                        keepAliveMap[i] = false;
-                                        responseBuffers[i] = resp.generateResponse(false);
-                                        sendOffsets[i] = 0;
-                                        FD_SET(i, &master_write);
-                                        size_t consumed = headerEnd + sepLen;
-                                        if (clientBuffers[i].size() > consumed) clientBuffers[i].erase(0, consumed); else clientBuffers[i].clear();
-                                        goto next_fd;
-                                    }
-
-                                    if (expectContinue && !sentContinueMap[i]) {
-                                        static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
-                                        size_t len = sizeof(kContinue) - 1;
-                                        ssize_t s = send(i, kContinue, len, 0);
-                                        if (s < 0) s = 0; 
-                                        if ((size_t)s < len) {
-                                            continueBuffers[i] = std::string(kContinue + s, len - s);
-                                            continueOffsets[i] = 0;
-                                            FD_SET(i, &master_write);
-                                        }
-                                        sentContinueMap[i] = true;
-                                    }
-
-                                    if (hasContentLength) {
-                                        size_t have = (clientBuffers[i].size() > bodyStart) ? (clientBuffers[i].size() - bodyStart) : 0;
-                                        if (have < contentLength) {
-                                            break;
-                                        }
-                                    } else if (isChunked) {
-                                        if (!chunkedInited[i]) {
-                                            size_t reqLineEnd2 = clientBuffers[i].find("\r\n");
-                                            chunkedReqLine[i] = (reqLineEnd2 != std::string::npos) ? clientBuffers[i].substr(0, reqLineEnd2) : "";
-                                            std::string headersPart = clientBuffers[i].substr(reqLineEnd2 + 2, headerEnd - (reqLineEnd2 + 2));
-                                            std::istringstream hsin(headersPart);
-                                            std::string hline; std::string newHeaders;
-                                            while (std::getline(hsin, hline)) {
-                                                if (!hline.empty() && hline[hline.size()-1] == '\r') hline.erase(hline.size()-1);
-                                                if (hline.empty()) continue;
-                                                size_t colon = hline.find(':'); if (colon == std::string::npos) continue;
-                                                std::string name = hline.substr(0, colon);
-                                                std::string lower = name; for (size_t k = 0; k < lower.size(); ++k) { char c = lower[k]; if (c >= 'A' && c <= 'Z') lower[k] = c + 32; }
-                                                if (lower == "transfer-encoding" || lower == "content-length") continue;
-                                                newHeaders += name + ":" + hline.substr(colon + 1) + "\r\n";
-                                            }
-                                            chunkedNewHeaders[i] = newHeaders;
-                                            chunkedDecoded[i].clear();
-                                            chunkedPos[i] = bodyStart;
-                                            chunkedComplete[i] = false;
-                                            chunkedConsumedEnd[i] = headerEnd + 4;
-                                            chunkedInited[i] = true;
-                                        }
-
-                                        size_t pos = chunkedPos[i];
-                                        bool progressed = false;
-                                        while (true) {
-                                            size_t lineEnd = clientBuffers[i].find("\r\n", pos);
-                                            if (lineEnd == std::string::npos) break;
-                                            std::string sizeLine = clientBuffers[i].substr(pos, lineEnd - pos);
-                                            size_t sc = sizeLine.find(';'); if (sc != std::string::npos) sizeLine = sizeLine.substr(0, sc);
-                                            size_t f = sizeLine.find_first_not_of(" \t"); size_t l = sizeLine.find_last_not_of(" \t");
-                                            if (f == std::string::npos) break;
-                                            sizeLine = sizeLine.substr(f, l - f + 1);
-                                            unsigned long chunkSize = 0; { std::istringstream xs(sizeLine); xs >> std::hex >> chunkSize; if (xs.fail()) break; }
-                                            pos = lineEnd + 2;
-                                            if (chunkSize == 0) {
-                                                size_t afterZero = clientBuffers[i].find("\r\n\r\n", pos);
-                                                if (afterZero == std::string::npos) break;
-                                                chunkedConsumedEnd[i] = afterZero + 4;
-                                                chunkedComplete[i] = true;
-                                                progressed = true;
-                                                pos = chunkedConsumedEnd[i];
-                                                break;
-                                            }
-                                            if (clientBuffers[i].size() < pos + chunkSize + 2) break;
-                                            if (requestConfig.clientMaxBodySize > 0 && (long)(chunkedDecoded[i].size() + chunkSize) > requestConfig.clientMaxBodySize) {
-                                                std::cerr << "DEBUG: Rejecting chunked request: next chunk " << chunkSize << " would exceed max body " << requestConfig.clientMaxBodySize << std::endl;
-                                                {
-                                                    std::ofstream logFile("server.log", std::ios::app);
-                                                    if (logFile.is_open()) {
-                                                        logFile << "413 early reject: chunked, next chunk " << chunkSize << " causes total > max " << requestConfig.clientMaxBodySize << std::endl;
-                                                    }
-                                                }
-                                                HttpResponse resp; resp.setStatus(413); serveErrorPage(resp, 413, requestConfig); resp.setHeader("Connection", "close");
-                                                keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
-                                                size_t consumedHdr2 = headerEnd + 4; if (clientBuffers[i].size() > consumedHdr2) clientBuffers[i].erase(0, consumedHdr2); else clientBuffers[i].clear();
-                                                
-                                                chunkedInited.erase(i); chunkedPos.erase(i); chunkedDecoded.erase(i);
-                                                chunkedReqLine.erase(i); chunkedNewHeaders.erase(i); chunkedComplete.erase(i); chunkedConsumedEnd.erase(i);
-                                                goto next_fd;
-                                            }
-                                            chunkedDecoded[i].append(clientBuffers[i], pos, chunkSize);
-                                            pos += chunkSize;
-                                            if (!(clientBuffers[i][pos] == '\r' && clientBuffers[i][pos+1] == '\n')) break;
-                                            pos += 2;
-                                            progressed = true;
-                                        }
-                                        if (progressed) chunkedPos[i] = pos;
-                                        if (!chunkedComplete[i]) {
-                                            break;
-                                        }
-                                        std::ostringstream cl; cl << "Content-Length: " << chunkedDecoded[i].size() << "\r\n";
-                                        std::string newHeaders = chunkedNewHeaders[i] + cl.str();
-                                        normalizedRequestForParse = chunkedReqLine[i] + "\r\n" + newHeaders + "\r\n" + chunkedDecoded[i];
-                                        hasContentLength = true; contentLength = chunkedDecoded[i].size();
-                                        consumedEndForErase = chunkedConsumedEnd[i];
-                                    }
-                                    try {
-                                        HttpRequest request;
-                                        if (!normalizedRequestForParse.empty()) request.parseRequest(normalizedRequestForParse);
-                                        else request.parseRequest(clientBuffers[i]);
-                                        HttpResponse response;
-                                        
-                                        bool responseReady = false;
-                                        dispatchRequest(i, request, response, requestConfig, responseReady);
-
-                                        // Only send response if ready (non-CGI or synchronous handler)
-                                        if (responseReady) {
-                                            std::string connectionHeader = request.getHeader("Connection");
-                                            std::string version = request.getVersion();
-                                            std::string connLower = connectionHeader;
-                                            for (size_t k = 0; k < connLower.size(); ++k) { char c = connLower[k]; if (c >= 'A' && c <= 'Z') connLower[k] = c + 32; }
-                                            bool keepAlive = false;
-                                            if (version == "HTTP/1.1") {
-                                                keepAlive = (connLower != "close");
-                                            } else { 
-                                                keepAlive = (connLower == "keep-alive");
-                                            }
-                                            keepAliveMap[i] = keepAlive;
-                                            response.setHeader("Connection", keepAlive ? "keep-alive" : "close");
-
-                                            std::string resp = response.generateResponse(request.getMethod() == "HEAD");
-                                            responseBuffers[i] = resp;
-                                            sendOffsets[i] = 0;
-                                            FD_SET(i, &master_write);
-                                        }
-
-                                        size_t consumed = 0;
-                                        if (!normalizedRequestForParse.empty()) consumed = consumedEndForErase; 
-                                        else if (hasContentLength) consumed = bodyStart + contentLength; else consumed = headerEnd + sepLen;
-                                        if (clientBuffers[i].size() > consumed) {
-                                            clientBuffers[i].erase(0, consumed);
-                                        } else {
-                                            clientBuffers[i].clear();
-                                        }
-                                        chunkedInited.erase(i);
-                                        chunkedPos.erase(i);
-                                        chunkedDecoded.erase(i);
-                                        chunkedReqLine.erase(i);
-                                        chunkedNewHeaders.erase(i);
-                                        chunkedComplete.erase(i);
-                                        chunkedConsumedEnd.erase(i);
-                                    } catch (const std::exception& e) {
-                                        std::cerr << "ERROR: fd " << i << " Exception while handling request: " << e.what() << std::endl;
-                                        HttpResponse err; err.setStatus(500); err.setHeader("Content-Type", "text/html"); err.setBody("<html><body><h1>500 Internal Server Error</h1></body></html>");
-                                        responseBuffers[i] = err.generateResponse();
-                                        sendOffsets[i] = 0;
-                                        FD_SET(i, &master_write);
-                                    }
-                                }
-                            }
-                            else {
-                                if (clientBuffers[i].size() > MAX_HEADER_BYTES) {
-                                    std::cerr << "DEBUG: 431 triggered. Buffer size: " << clientBuffers[i].size() << std::endl;
-                                    std::cerr << "DEBUG: Buffer content (first 200 bytes): [" << clientBuffers[i].substr(0, 200) << "]" << std::endl;
-                                    int port = clientPortMap[i];
-                                    const ConfigParser::ServerConfig& tempConfig = selectConfig(port, "");
-                                    HttpResponse resp; resp.setStatus(431); serveErrorPage(resp, 431, tempConfig); resp.setHeader("Connection", "close");
-                                    keepAliveMap[i] = false; responseBuffers[i] = resp.generateResponse(false); sendOffsets[i] = 0; FD_SET(i, &master_write);
-                                    clientBuffers[i].clear();
-                                    goto next_fd;
-                                }
+                            state.inBuffer.append(buffer, bytesRead);
+                            state.lastActivity = now;
+                            if (state.inBuffer.size() > MAX_REQUEST_BYTES) {
+                                HttpResponse resp;
+                                resp.setStatus(413);
+                                serveErrorPage(resp, 413, selectConfig(state.port, ""));
+                                state.keepAlive = false;
+                                state.outBuffer = resp.generateResponse(false);
+                                state.outOffset = 0;
+                                FD_SET(fd, &master_write);
+                                break;
                             }
                         } else if (bytesRead == 0) {
-                            // Clean up CGI if active
-                            std::map<int, CgiState>::iterator cgit = cgiStates.find(i);
-                            if (cgit != cgiStates.end()) {
-                                if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
-                                if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
-                                kill(cgit->second.pid, SIGKILL);
-                                waitpid(cgit->second.pid, NULL, WNOHANG);
-                                cgiStates.erase(cgit);
-                            }
-                            
-                            close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
-                            clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
-                            sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
-                            chunkedInited.erase(i); chunkedPos.erase(i); chunkedDecoded.erase(i);
-                            chunkedReqLine.erase(i); chunkedNewHeaders.erase(i); chunkedComplete.erase(i); chunkedConsumedEnd.erase(i);
-                            clientPortMap.erase(i);
+                            // Client closed the connection
+                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                            restartClientsLoop = true;
                             break;
                         } else {
+                            // For non-blocking sockets, EAGAIN/EWOULDBLOCK just mean "no more data"
                             if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                                break; 
+                                break;
+                            }
+                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                            restartClientsLoop = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (restartClientsLoop) {
+                    it = clients.begin();
+                    continue;
+                }
+
+                // Attempt to parse complete requests
+                bool parsed = true;
+                while (parsed) {
+                    parsed = false;
+                    size_t headerEnd = state.inBuffer.find("\r\n\r\n");
+                    size_t sepLen = 4;
+                    if (headerEnd == std::string::npos) {
+                        headerEnd = state.inBuffer.find("\n\n");
+                        sepLen = 2;
+                    }
+                    if (headerEnd == std::string::npos) {
+                        if (state.inBuffer.size() > MAX_HEADER_BYTES) {
+                            HttpResponse resp;
+                            resp.setStatus(431);
+                            serveErrorPage(resp, 431, selectConfig(state.port, ""));
+                            state.keepAlive = false;
+                            state.outBuffer = resp.generateResponse(false);
+                            state.outOffset = 0;
+                            FD_SET(fd, &master_write);
+                        }
+                        break;
+                    }
+
+                    size_t bodyStart = headerEnd + sepLen;
+                    std::string headerBlock = state.inBuffer.substr(0, headerEnd);
+                    std::map<std::string, std::string> headers = parseHeaderMap(headerBlock);
+                    std::string hostHeader = headers["host"];
+                    bool hasContentLength = headers.find("content-length") != headers.end();
+                    size_t contentLength = 0;
+                    if (hasContentLength) {
+                        std::istringstream iss(headers["content-length"]);
+                        iss >> contentLength;
+                    }
+                    bool isChunked = headers.find("transfer-encoding") != headers.end() &&
+                                     headers["transfer-encoding"].find("chunked") != std::string::npos;
+                    state.expectContinue = headers.find("expect") != headers.end() &&
+                                           headers["expect"].find("100-continue") != std::string::npos;
+
+                    const ConfigParser::ServerConfig& cfg = selectConfig(state.port, hostHeader);
+
+                    if (state.expectContinue && !state.sentContinue) {
+                        static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                        state.outBuffer += std::string(kContinue);
+                        state.outOffset = 0;
+                        state.sentContinue = true;
+                        FD_SET(fd, &master_write);
+                    }
+
+                    std::string normalizedRequest;
+                    size_t consumed = 0;
+                    if (isChunked) {
+                        size_t consumedEnd = 0;
+                        if (!decodeChunkedBody(state.inBuffer, bodyStart, consumedEnd, state.chunkDecoded)) {
+                            break;
+                        }
+                        std::string reqLine = state.inBuffer.substr(0, state.inBuffer.find("\r\n"));
+                        std::string headersOnly = state.inBuffer.substr(state.inBuffer.find("\r\n") + 2, headerEnd - (state.inBuffer.find("\r\n") + 2));
+                        std::istringstream hsin(headersOnly);
+                        std::string line;
+                        std::string rebuiltHeaders;
+                        while (std::getline(hsin, line)) {
+                            if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+                            size_t colon = line.find(':');
+                            if (colon == std::string::npos) continue;
+                            std::string lower = toLower(line.substr(0, colon));
+                            if (lower == "transfer-encoding" || lower == "content-length") continue;
+                            rebuiltHeaders += line + "\r\n";
+                        }
+                        std::ostringstream cl;
+                        cl << "Content-Length: " << state.chunkDecoded.size() << "\r\n";
+                        rebuiltHeaders += cl.str();
+                        normalizedRequest = reqLine + "\r\n" + rebuiltHeaders + "\r\n" + state.chunkDecoded;
+                        consumed = consumedEnd;
+                        hasContentLength = true;
+                        contentLength = state.chunkDecoded.size();
+                    } else if (hasContentLength) {
+                        size_t have = state.inBuffer.size() > bodyStart ? state.inBuffer.size() - bodyStart : 0;
+                        if (have < contentLength) break;
+                        consumed = bodyStart + contentLength;
+                        normalizedRequest = state.inBuffer.substr(0, consumed);
+                    } else {
+                        consumed = bodyStart;
+                        normalizedRequest = state.inBuffer.substr(0, consumed);
+                    }
+
+                    try {
+                        HttpRequest req;
+                        req.parseRequest(normalizedRequest);
+                        HttpResponse resp;
+                        bool responseReady = false;
+                        dispatchRequest(fd, req, resp, cfg, responseReady, state);
+                        if (responseReady) {
+                            std::string connHeader = req.getHeader("Connection");
+                            std::string version = req.getVersion();
+                            std::string connLower = toLower(connHeader);
+                            bool keep = false;
+                            if (version == "HTTP/1.1") keep = (connLower != "close");
+                            else keep = (connLower == "keep-alive");
+                            state.keepAlive = keep;
+                            resp.setHeader("Connection", keep ? "keep-alive" : "close");
+                            state.outBuffer += resp.generateResponse(req.getMethod() == "HEAD");
+                            state.outOffset = 0;
+                            FD_SET(fd, &master_write);
+                            if (fd > fdmax) fdmax = fd;
+                        }
+                    } catch (const std::exception& e) {
+                        HttpResponse err;
+                        err.setStatus(400);
+                        serveErrorPage(err, 400, cfg);
+                        state.keepAlive = false;
+                        state.outBuffer += err.generateResponse(false);
+                        state.outOffset = 0;
+                        FD_SET(fd, &master_write);
+                    }
+
+                    if (consumed >= state.inBuffer.size()) state.inBuffer.clear();
+                    else state.inBuffer.erase(0, consumed);
+                    state.expectContinue = false;
+                    state.sentContinue = false;
+                    state.chunkDecoded.clear();
+                    parsed = true;
+                }
+
+                ++it;
+            }
+
+            // Write to clients
+            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+                int fd = it->first;
+                ClientState& st = it->second;
+                bool restartClientsLoop = false;
+
+                if (FD_ISSET(fd, &write_fds)) {
+                    // Send buffered response bytes
+                    while (st.outOffset < st.outBuffer.size()) {
+                        ssize_t sent = send(fd, st.outBuffer.c_str() + st.outOffset, st.outBuffer.size() - st.outOffset, 0);
+                        if (sent > 0) {
+                            st.outOffset += sent;
+                            st.lastActivity = now;
+                        } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                            // Not ready to send more; try again on next loop
+                            break;
+                        } else {
+                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                            restartClientsLoop = true;
+                            break;
+                        }
+                    }
+                    if (restartClientsLoop) { it = clients.begin(); continue; }
+
+                    if (st.outOffset >= st.outBuffer.size()) {
+                        st.outBuffer.clear();
+                        st.outOffset = 0;
+                    }
+
+                    // Stream file if needed
+                    if (st.fileStream.active && st.outBuffer.empty()) {
+                        if (st.fileStream.pendingChunk.empty() && st.fileStream.offset < st.fileStream.size) {
+                            char fbuf[FILE_CHUNK_BYTES];
+                            ssize_t r = read(st.fileStream.fd, fbuf, FILE_CHUNK_BYTES);
+                            if (r > 0) {
+                                st.fileStream.pendingChunk.assign(fbuf, r);
+                                st.fileStream.offset += r;
+                            } else if (r == 0) {
+                                clearFileStream(st.fileStream);
                             } else {
-                                std::cerr << "ERROR: fd " << i << " recv error: " << strerror(errno) << std::endl;
-                                
-                                // Clean up CGI if active
-                                std::map<int, CgiState>::iterator cgit = cgiStates.find(i);
-                                if (cgit != cgiStates.end()) {
-                                    if (cgit->second.pipe_in != -1) close(cgit->second.pipe_in);
-                                    if (cgit->second.pipe_out != -1) close(cgit->second.pipe_out);
-                                    kill(cgit->second.pid, SIGKILL);
-                                    waitpid(cgit->second.pid, NULL, WNOHANG);
-                                    cgiStates.erase(cgit);
-                                }
-                                
-                                close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
-                                clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
-                                sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
-                                chunkedInited.erase(i); chunkedPos.erase(i); chunkedDecoded.erase(i);
-                                chunkedReqLine.erase(i); chunkedNewHeaders.erase(i); chunkedComplete.erase(i); chunkedConsumedEnd.erase(i);
-                                clientPortMap.erase(i);
+                                closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                                restartClientsLoop = true;
+                            }
+                        }
+                        if (restartClientsLoop) { it = clients.begin(); continue; }
+
+                        while (!st.fileStream.pendingChunk.empty()) {
+                            ssize_t sent = send(fd, st.fileStream.pendingChunk.c_str(), st.fileStream.pendingChunk.size(), 0);
+                            if (sent > 0) {
+                                st.fileStream.pendingChunk.erase(0, sent);
+                                st.lastActivity = now;
+                            } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                                // Socket not ready for more; try later
+                                break;
+                            } else {
+                                closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                                restartClientsLoop = true;
                                 break;
                             }
                         }
-                    }
-                }
+                        if (restartClientsLoop) { it = clients.begin(); continue; }
 
-                if (FD_ISSET(i, &write_fds)) {
-                    // Check if it's a CGI pipe (skip, already handled above)
-                    bool isCgiPipe = false;
-                    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
-                        if (i == cit->second.pipe_in) {
-                            isCgiPipe = true;
-                            break;
-                        }
-                    }
-                    if (isCgiPipe) continue;
-                    
-                    std::map<int, std::string>::iterator cit = continueBuffers.find(i);
-                    if (cit != continueBuffers.end()) {
-                        const std::string& data = cit->second;
-                        size_t& off = continueOffsets[i];
-                        while (off < data.size()) {
-                            ssize_t sent = send(i, data.c_str() + off, data.size() - off, 0);
-                            if (sent > 0) {
-                                off += sent; lastActivity[i] = now;
-                            } else {
-                                if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                                    break; 
-                                } else {
-                                    std::cerr << "ERROR: fd " << i << " send error (continue): " << strerror(errno) << std::endl;
-                                    close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
-                                    clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
-                                    sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
-                                    clientPortMap.erase(i);
-                                    goto next_fd; 
-                                }
-                            }
-                        }
-                        if (off >= data.size()) {
-                            continueBuffers.erase(i); continueOffsets.erase(i);
-                        } else {
-                            goto next_fd;
+                        if (st.fileStream.pendingChunk.empty() && st.fileStream.offset >= st.fileStream.size) {
+                            clearFileStream(st.fileStream);
                         }
                     }
 
-                    std::map<int, std::string>::iterator it = responseBuffers.find(i);
-                    if (it != responseBuffers.end()) {
-                        const std::string& data = it->second;
-                        size_t& off = sendOffsets[i];
-                        while (off < data.size()) {
-                            ssize_t sent = send(i, data.c_str() + off, data.size() - off, 0);
-                            if (sent > 0) {
-                                off += sent; lastActivity[i] = now;
-                            } else {
-                                if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                                    break; 
-                                } else {
-                                    std::cerr << "ERROR: fd " << i << " send error: " << strerror(errno) << std::endl;
-                                    close(i); FD_CLR(i, &master_read); FD_CLR(i, &master_write);
-                                    clientBuffers.erase(i); responseBuffers.erase(i); sendOffsets.erase(i); keepAliveMap.erase(i);
-                                    sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
-                                    clientPortMap.erase(i);
-                                    goto next_fd; 
-                                }
-                            }
-                        }
-                        if (off >= data.size()) {
-                            responseBuffers.erase(i); sendOffsets.erase(i);
-                            FD_CLR(i, &master_write);
-                            if (!keepAliveMap[i]) {
-                                close(i); FD_CLR(i, &master_read);
-                                clientBuffers.erase(i); keepAliveMap.erase(i); 
-                                sentContinueMap.erase(i); continueBuffers.erase(i); continueOffsets.erase(i); lastActivity.erase(i);
-                                clientPortMap.erase(i);
-                            } else {
-                                sentContinueMap[i] = false;
-                                continueBuffers.erase(i);
-                                continueOffsets.erase(i);
-                            }
+                    if (!needsWrite(st)) {
+                        FD_CLR(fd, &master_write);
+                        if (!st.keepAlive) {
+                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                            restartClientsLoop = true;
                         }
                     }
                 }
-                next_fd: ;
+
+                if (restartClientsLoop) {
+                    it = clients.begin();
+                    continue;
+                }
+
+                ++it;
             }
         }
 
         for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) { close(*it); }
-        if (logFile.is_open()) { logFile.close(); }
 
     } catch (const std::exception& e) {
         std::cerr << "Server error: " << e.what() << std::endl;
@@ -999,64 +789,25 @@ void Server::start() {
 
 
 void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& response, 
-                              const ConfigParser::ServerConfig& config, bool& responseReady) {
+                              const ConfigParser::ServerConfig& config, bool& responseReady, ClientState& state) {
     responseReady = true; // Default: response is ready unless CGI
+    clearFileStream(state.fileStream);
     
     const LocationConfig& locConfig = findLocationConfig(config, request.getPath());
     std::string effectiveRoot = locConfig.getRoot().empty() ? config.root : locConfig.getRoot();
     std::string path = request.getPath();
-    bool isCgiRequest = false;
-
-    bool endsWithBla = path.size() >= 4 && path.substr(path.size() - 4) == ".bla";
-    const LocationConfig* cgiLocPtr = &locConfig;
-    if (endsWithBla) {
-        for (std::map<std::string, LocationConfig>::const_iterator it = config.locations.begin(); it != config.locations.end(); ++it) {
-            const std::string& key = it->first;
-            if (key.find("\\.bla") != std::string::npos) {
-                cgiLocPtr = &it->second;
-                break;
-            }
-        }
-    }
-
-    LocationConfig fallbackCgiLoc;
-    if (endsWithBla && request.getMethod() == "POST" && cgiLocPtr == &locConfig && locConfig.getCgiPass().empty()) {
-        std::vector<std::string> m; m.push_back("POST");
-        fallbackCgiLoc.setPath("~ \\ .bla$");
-        fallbackCgiLoc.setRoot(".");
-        fallbackCgiLoc.setMethods(m);
-        fallbackCgiLoc.setCgiPass("./cgi_test");
-        cgiLocPtr = &fallbackCgiLoc;
-    }
-    
-    if (path.find("/cgi-bin/") != std::string::npos || 
-        path.find(".php") != std::string::npos || 
-        path.find(".py") != std::string::npos || 
+    bool isCgiRequest =
+        path.find("/cgi-bin/") != std::string::npos ||
+        path.find(".php") != std::string::npos ||
+        path.find(".py")  != std::string::npos ||
         path.find(".cgi") != std::string::npos ||
-        !locConfig.getCgiPass().empty() ||
-        (endsWithBla && request.getMethod() == "POST")) {
-        isCgiRequest = true;
-    }
+        !locConfig.getCgiPass().empty();
 
-    if (request.getMethod() == "POST" && path.find("/post_body") == 0) {
-        if (request.getBody().size() > 100) {
-            response.setStatus(413); 
-            serveErrorPage(response, 413, config);
-            return;
-        } else {
-            response.setStatus(200);
-            response.setHeader("Content-Type", "text/plain");
-            response.setBody(request.getBody());
-            return;
-        }
-    }
-    
     // Handle CGI requests
-    if (isCgiRequest && (request.getMethod() == "POST" || request.getMethod() == "GET")) {
-        std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot()
-                                   : (!cgiLocPtr->getRoot().empty() ? cgiLocPtr->getRoot() : config.root);
+    if (isCgiRequest && (request.getMethod() == "POST" || request.getMethod() == "GET" || request.getMethod() == "HEAD")) {
+        std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot() : config.root;
         bool isHead = (request.getMethod() == "HEAD");
-        bool cgiStarted = startCgiRequest(clientFd, request, config, *cgiLocPtr, cgiEffectiveRoot, isHead);
+        bool cgiStarted = startCgiRequest(clientFd, request, config, locConfig, cgiEffectiveRoot, isHead);
         if (cgiStarted) {
             responseReady = false; // Response will be generated later when CGI completes
             return;
@@ -1086,7 +837,7 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
     
     if (request.getMethod() == "GET" || request.getMethod() == "HEAD") {
         handleGetHeadRequest(request, response, config, locConfig, effectiveRoot, 
-                          request.getMethod() == "HEAD");
+                          request.getMethod() == "HEAD", state.fileStream);
     } else if (request.getMethod() == "POST") {
         handlePostRequest(request, response, config, locConfig, effectiveRoot);
     } else if (request.getMethod() == "PUT") {

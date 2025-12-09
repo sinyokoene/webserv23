@@ -2,13 +2,27 @@
 #include "Server.hpp"
 #include <string>
 #include <cstdlib>
+#include <limits.h>
+#include <unistd.h>
+
+static std::string canonicalPath(const std::string& path) {
+    char resolved[PATH_MAX];
+    if (realpath(path.c_str(), resolved)) {
+        return std::string(resolved);
+    }
+    return path; // fallback to original; open will fail with clear message if missing
+}
 
 int main(int argc, char* argv[]) {
+    // Prevent SIGPIPE from terminating the process on client disconnects during send()
+    signal(SIGPIPE, SIG_IGN);
+
     std::string configFilePath = "config/default.conf"; // Default config file
 
     if (argc > 1) {
         configFilePath = argv[1]; // Use command line argument if provided
     }
+    configFilePath = canonicalPath(configFilePath);
 
     try {
         // Initialize the server with the configuration file path

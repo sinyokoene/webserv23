@@ -2,6 +2,7 @@
 #include "Utils.hpp"
 #include <sys/stat.h>
 #include <dirent.h>
+#include <fcntl.h>
 
 static std::string extractFilenameFromContentDisposition(const std::string& headerValue) {
     // Try RFC5987 filename* first
@@ -56,7 +57,16 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
                                  const ConfigParser::ServerConfig& config, 
                                  const LocationConfig& locConfig, 
                                  const std::string& effectiveRoot,
-                                 bool isHead) {
+                                 bool isHead,
+                                 FileStreamState& streamPlan) {
+    if (streamPlan.fd != -1) close(streamPlan.fd);
+    streamPlan.fd = -1;
+    streamPlan.offset = 0;
+    streamPlan.size = 0;
+    streamPlan.active = false;
+    streamPlan.pendingChunk.clear();
+    streamPlan.isHead = isHead;
+    const size_t INLINE_LIMIT = 64 * 1024;
     // Check if there's a redirect defined for this location
     if (!locConfig.getRedirect().empty()) {
         response.setStatus(301); // Moved Permanently
@@ -154,23 +164,38 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
         }
     } else if (S_ISREG(st.st_mode)) {
         // Regular file handling
-        std::ifstream file(resolvedPath.c_str(), std::ios::binary);
-        if (file.is_open()) {
-            if (!isHead) {
-                std::ostringstream ss;
-                ss << file.rdbuf();
-                response.setBody(ss.str());
-            }
-            file.close();
-        } else {
-            // Could not open the file, even though stat succeeded
-            response.setStatus(500);
-            serveErrorPage(response, 500, config);
-            return;
-        }
         response.setStatus(200);
         response.setHeader("Content-Type", getMimeType(resolvedPath));
-        if (isHead) { std::ostringstream sizeStr; sizeStr << st.st_size; response.setHeader("Content-Length", sizeStr.str()); }
+        std::ostringstream sizeStr; sizeStr << st.st_size; response.setHeader("Content-Length", sizeStr.str());
+        if (!isHead && static_cast<size_t>(st.st_size) > INLINE_LIMIT) {
+            int fd = open(resolvedPath.c_str(), O_RDONLY);
+            if (fd < 0) {
+                response.setStatus(500);
+                serveErrorPage(response, 500, config);
+                return;
+            }
+            streamPlan.fd = fd;
+            streamPlan.offset = 0;
+            streamPlan.size = st.st_size;
+            streamPlan.active = true;
+            streamPlan.pendingChunk.clear();
+            streamPlan.isHead = false;
+            response.setBody(""); // body streamed later
+        } else {
+            std::ifstream file(resolvedPath.c_str(), std::ios::binary);
+            if (file.is_open()) {
+                if (!isHead) {
+                    std::ostringstream ss;
+                    ss << file.rdbuf();
+                    response.setBody(ss.str());
+                }
+                file.close();
+            } else {
+                response.setStatus(500);
+                serveErrorPage(response, 500, config);
+                return;
+            }
+        }
     } else {
         // Niet een map of regulier bestand
         response.setStatus(403);
@@ -346,10 +371,36 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
 // Handler for DELETE requests
 void Server::handleDeleteRequest(HttpRequest& request, HttpResponse& response, 
                                const ConfigParser::ServerConfig& config, 
-                               const LocationConfig& /*locConfig*/, // Marked as unused
+                               const LocationConfig& locConfig,
                                const std::string& effectiveRoot) {
-    // Los het te verwijderen bestand op
-    std::string resolvedPath = resolvePath(config, effectiveRoot, request.getPath());
+    // Resolve the base directory. If an upload_store is configured for this location,
+    // deletions should target that store to stay consistent with PUT/POST handling.
+    std::string targetDir = effectiveRoot;
+    if (!locConfig.getUploadStore().empty()) {
+        std::string uploadStore = locConfig.getUploadStore();
+        if (!uploadStore.empty() && uploadStore[0] == '/') uploadStore = uploadStore.substr(1);
+        std::string resolvedStore = resolvePath(config, effectiveRoot, uploadStore);
+        if (!resolvedStore.empty()) {
+            targetDir = resolvedStore;
+        }
+    }
+
+    // Derive the path relative to the location prefix
+    std::string uriPath = request.getPath();
+    std::string locPath = locConfig.getPath();
+    std::string relativeSubpath;
+    if (!locPath.empty() && uriPath.find(locPath) == 0) {
+        if (uriPath.length() > locPath.size()) {
+            relativeSubpath = uriPath.substr(locPath.size());
+        }
+        if (!relativeSubpath.empty() && relativeSubpath[0] == '/') relativeSubpath = relativeSubpath.substr(1);
+    }
+    // If nothing remains and the location path is file-like (no trailing slash), use it as the target name
+    if (relativeSubpath.empty() && !locPath.empty() && locPath[locPath.size() - 1] != '/') {
+        relativeSubpath = (locPath[0] == '/') ? locPath.substr(1) : locPath;
+    }
+
+    std::string resolvedPath = resolvePath(config, targetDir, relativeSubpath);
     if (resolvedPath.empty()) {
         response.setStatus(403); // Verboden
         serveErrorPage(response, 403, config);

@@ -54,6 +54,50 @@ struct CgiState {
                  startTime(0), lastIO(0), config(NULL), isHead(false) {}
 };
 
+// Per-connection file streaming state
+struct FileStreamState {
+    int fd;
+    off_t offset;
+    off_t size;
+    bool active;
+    bool isHead;
+    std::string pendingChunk;
+
+    FileStreamState() : fd(-1), offset(0), size(0), active(false), isHead(false), pendingChunk() {}
+};
+
+// Per-connection state tracked by the event loop
+struct ClientState {
+    std::string inBuffer;
+    std::string outBuffer;
+    size_t outOffset;
+    bool keepAlive;
+    bool closing;
+    bool expectContinue;
+    bool sentContinue;
+    time_t lastActivity;
+    int port;
+    bool chunkedMode;
+    bool chunkComplete;
+    std::string chunkDecoded;
+    size_t contentLength;
+    size_t bodyStart;
+    FileStreamState fileStream;
+
+    ClientState()
+        : outOffset(0),
+          keepAlive(false),
+          closing(false),
+          expectContinue(false),
+          sentContinue(false),
+          lastActivity(0),
+          port(0),
+          chunkedMode(false),
+          chunkComplete(false),
+          contentLength(0),
+          bodyStart(0) {}
+};
+
 class Server {
 public:
     Server(const std::string& configFile);
@@ -68,14 +112,15 @@ private:
     std::set<std::string> getAllowedMethodsForPath(const std::string& path, const ConfigParser::ServerConfig& config) const;
 
     void dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& response, 
-                         const ConfigParser::ServerConfig& config, bool& responsReady);
+                         const ConfigParser::ServerConfig& config, bool& responsReady, ClientState& state);
     
     // Specific HTTP method handlers
     void handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
                               const ConfigParser::ServerConfig& config,
                               const LocationConfig& locConfig,
                               const std::string& effectiveRoot,
-                              bool isHead);
+                              bool isHead,
+                              FileStreamState& streamPlan);
     void handlePostRequest(HttpRequest& request, HttpResponse& response,
                            const ConfigParser::ServerConfig& config,
                            const LocationConfig& locConfig,
@@ -93,8 +138,8 @@ private:
     
     // CGI Handler (now non-blocking)
     bool startCgiRequest(int clientFd, HttpRequest& request,
-                         const ConfigParser::ServerConfig& config,
-                         const LocationConfig& locConfig,
+                          const ConfigParser::ServerConfig& config,
+                          const LocationConfig& locConfig,
                          const std::string& effectiveRoot,
                          bool isHead);
     
