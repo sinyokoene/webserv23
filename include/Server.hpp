@@ -154,6 +154,27 @@ private:
     // Config selection
     const ConfigParser::ServerConfig& selectConfig(int port, const std::string& hostHeader) const;
 
+    // Event-loop helpers to keep start() readable
+    void buildPortMapping(std::set<int>& portsToBind);
+    bool bindListeningSockets(const std::set<int>& portsToBind);
+    void initMasterFdSets(fd_set& master_read, fd_set& master_write, int& fdmax) const;
+    void buildFdSets(const fd_set& master_read, const fd_set& master_write,
+                     fd_set& read_fds, fd_set& write_fds, int fdmax, int& loopFdMax);
+    void handleClientTimeouts(std::map<int, ClientState>& clients,
+                              fd_set& master_read, fd_set& master_write, time_t now);
+    void handleCgiTimeouts(std::map<int, ClientState>& clients,
+                           fd_set& master_write, int& fdmax, time_t now);
+    void acceptConnections(fd_set& master_read, int& fdmax,
+                           std::map<int, ClientState>& clients, time_t now);
+    void processCgiIo(fd_set& read_fds, fd_set& write_fds,
+                      fd_set& master_write, int& fdmax,
+                      std::map<int, ClientState>& clients);
+    void processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& master_write,
+                            int& fdmax, std::map<int, ClientState>& clients,
+                            time_t now);
+    void processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set& master_write,
+                             std::map<int, ClientState>& clients, time_t now);
+
     std::string configPath;
     std::vector<ConfigParser::ServerConfig> serverConfigs;
     ConfigParser::ServerConfig currentConfig; // Fallback

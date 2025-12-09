@@ -2,6 +2,14 @@
 #include "Utils.hpp"
 #include <signal.h>
 
+// Event loop tuning knobs
+static const int SELECT_TIMEOUT_SEC = 1;
+static const int CLIENT_TIMEOUT_SEC = 30;
+static const int CGI_TIMEOUT_SEC = 120;
+static const size_t MAX_HEADER_BYTES = 32 * 1024;
+static const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024;
+static const size_t FILE_CHUNK_BYTES = 16 * 1024;
+
 // ---- internal helpers ----------------------------------------------------
 static std::map<std::string, std::string> parseHeaderMap(const std::string& headerBlock) {
     std::map<std::string, std::string> headers;
@@ -69,6 +77,464 @@ static bool decodeChunkedBody(const std::string& data, size_t startPos, size_t& 
         pos += chunkSize;
         if (!(data[pos] == '\r' && data[pos + 1] == '\n')) return false;
         pos += 2;
+    }
+}
+
+static void cleanupCgi(int fd, std::map<int, CgiState>& cgiStates);
+static void closeClientFd(int fd, fd_set& mr, fd_set& mw, std::map<int, ClientState>& clients, std::map<int, CgiState>& cgiStates);
+
+void Server::buildPortMapping(std::set<int>& portsToBind) {
+    portsToBind.clear();
+    portToConfigs.clear();
+
+    if (serverConfigs.empty()) {
+        for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
+             it != currentConfig.listenPorts.end(); ++it) {
+            int port = atoi(it->c_str());
+            if (port > 0 && port <= 65535) {
+                portsToBind.insert(port);
+                portToConfigs[port].push_back(&currentConfig);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < serverConfigs.size(); ++i) {
+            for (std::vector<std::string>::const_iterator it = serverConfigs[i].listenPorts.begin();
+                 it != serverConfigs[i].listenPorts.end(); ++it) {
+                int port = atoi(it->c_str());
+                if (port > 0 && port <= 65535) {
+                    portsToBind.insert(port);
+                    portToConfigs[port].push_back(&serverConfigs[i]);
+                }
+            }
+        }
+    }
+}
+
+bool Server::bindListeningSockets(const std::set<int>& portsToBind) {
+    socketPortMap.clear();
+    serverSockets.clear();
+
+    for (std::set<int>::const_iterator it = portsToBind.begin(); it != portsToBind.end(); ++it) {
+        int port = *it;
+
+        int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSocket < 0) {
+            std::cerr << "Error creating socket for port " << port << ": " << strerror(errno) << std::endl;
+            continue;
+        }
+
+        int flags = fcntl(serverSocket, F_GETFL, 0);
+        if (flags != -1) fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
+
+        int optval = 1;
+        if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+            std::cerr << "Error setting socket options: " << strerror(errno) << std::endl;
+            close(serverSocket);
+            continue;
+        }
+
+        struct sockaddr_in serverAddr;
+        memset(&serverAddr, 0, sizeof(serverAddr));
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(port);
+
+        if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+            std::cerr << "Error binding socket to port " << port << ": " << strerror(errno) << std::endl;
+            close(serverSocket);
+            continue;
+        }
+
+        if (listen(serverSocket, 128) < 0) {
+            std::cerr << "Error listening on socket: " << strerror(errno) << std::endl;
+            close(serverSocket);
+            continue;
+        }
+
+        serverSockets.push_back(serverSocket);
+        socketPortMap[serverSocket] = port;
+        std::cout << "Server is listening on port " << port << std::endl;
+    }
+
+    if (serverSockets.empty()) {
+        std::cerr << "Failed to set up any server sockets. Exiting." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+void Server::initMasterFdSets(fd_set& master_read, fd_set& master_write, int& fdmax) const {
+    FD_ZERO(&master_read);
+    FD_ZERO(&master_write);
+    fdmax = 0;
+
+    for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
+        FD_SET(*it, &master_read);
+        if (*it > fdmax) fdmax = *it;
+    }
+}
+
+void Server::buildFdSets(const fd_set& master_read, const fd_set& master_write,
+                         fd_set& read_fds, fd_set& write_fds, int fdmax, int& loopFdMax) {
+    read_fds = master_read;
+    write_fds = master_write;
+    loopFdMax = fdmax;
+
+    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
+        if (cit->second.pipe_out != -1 && !cit->second.readComplete) {
+            FD_SET(cit->second.pipe_out, &read_fds);
+            if (cit->second.pipe_out > loopFdMax) loopFdMax = cit->second.pipe_out;
+        }
+        if (cit->second.pipe_in != -1 && !cit->second.writeComplete) {
+            FD_SET(cit->second.pipe_in, &write_fds);
+            if (cit->second.pipe_in > loopFdMax) loopFdMax = cit->second.pipe_in;
+        }
+    }
+}
+
+void Server::handleClientTimeouts(std::map<int, ClientState>& clients,
+                                  fd_set& master_read, fd_set& master_write, time_t now) {
+    for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+        if (now - it->second.lastActivity > CLIENT_TIMEOUT_SEC) {
+            closeClientFd(it->first, master_read, master_write, clients, cgiStates);
+            it = clients.begin();
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Server::handleCgiTimeouts(std::map<int, ClientState>& clients,
+                               fd_set& master_write, int& fdmax, time_t now) {
+    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
+        if (now - cit->second.lastIO > CGI_TIMEOUT_SEC) {
+            HttpResponse response;
+            serveErrorPage(response, 504, *cit->second.config);
+            int clientFd = cit->first;
+            if (clients.find(clientFd) != clients.end()) {
+                clients[clientFd].outBuffer = response.generateResponse(cit->second.isHead);
+                clients[clientFd].outOffset = 0;
+                FD_SET(clientFd, &master_write);
+                if (clientFd > fdmax) fdmax = clientFd;
+            }
+            cleanupCgi(clientFd, cgiStates);
+            cit = cgiStates.begin();
+        } else {
+            ++cit;
+        }
+    }
+}
+
+void Server::acceptConnections(fd_set& master_read, int& fdmax,
+                               std::map<int, ClientState>& clients, time_t now) {
+    for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
+        if (FD_ISSET(*it, &master_read)) {
+            while (true) {
+                struct sockaddr_in clientAddr;
+                socklen_t clientLen = sizeof(clientAddr);
+                int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
+                if (clientSocket < 0) {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) break;
+                    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+                    break;
+                }
+                int cflags = fcntl(clientSocket, F_GETFL, 0);
+                if (cflags != -1) fcntl(clientSocket, F_SETFL, cflags | O_NONBLOCK);
+                FD_SET(clientSocket, &master_read);
+                if (clientSocket > fdmax) fdmax = clientSocket;
+                ClientState cs;
+                cs.lastActivity = now;
+                cs.port = socketPortMap[*it];
+                clients[clientSocket] = cs;
+            }
+        }
+    }
+}
+
+void Server::processCgiIo(fd_set& read_fds, fd_set& write_fds,
+                          fd_set& master_write, int& fdmax,
+                          std::map<int, ClientState>& clients) {
+    for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
+        CgiState& cgi = cit->second;
+        int clientFd = cit->first;
+        if (cgi.pipe_in != -1 && FD_ISSET(cgi.pipe_in, &write_fds)) {
+            handleCgiWrite(clientFd, cgi);
+        }
+        if (cgi.pipe_out != -1 && FD_ISSET(cgi.pipe_out, &read_fds)) {
+            handleCgiRead(clientFd, cgi);
+        }
+        if (cgi.readComplete) {
+            int status;
+            pid_t result = waitpid(cgi.pid, &status, WNOHANG);
+            if (result != 0) {
+                std::string response;
+                finalizeCgiRequest(clientFd, cgi, status, response);
+                if (clients.find(clientFd) != clients.end()) {
+                    clients[clientFd].outBuffer = response;
+                    clients[clientFd].outOffset = 0;
+                    clients[clientFd].keepAlive = false;
+                    FD_SET(clientFd, &master_write);
+                    if (clientFd > fdmax) fdmax = clientFd;
+                }
+                cleanupCgi(clientFd, cgiStates);
+                cit = cgiStates.begin();
+                continue;
+            }
+        }
+        ++cit;
+    }
+}
+
+void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& master_write,
+                                int& fdmax, std::map<int, ClientState>& clients,
+                                time_t now) {
+    for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+        int fd = it->first;
+        ClientState& state = it->second;
+        bool restartClientsLoop = false;
+
+        if (FD_ISSET(fd, &read_fds)) {
+            char buffer[8192];
+            while (true) {
+                ssize_t bytesRead = recv(fd, buffer, sizeof(buffer), 0);
+                if (bytesRead > 0) {
+                    state.inBuffer.append(buffer, bytesRead);
+                    state.lastActivity = now;
+                    if (state.inBuffer.size() > MAX_REQUEST_BYTES) {
+                        HttpResponse resp;
+                        resp.setStatus(413);
+                        serveErrorPage(resp, 413, selectConfig(state.port, ""));
+                        state.keepAlive = false;
+                        state.outBuffer = resp.generateResponse(false);
+                        state.outOffset = 0;
+                        FD_SET(fd, &master_write);
+                        break;
+                    }
+                } else if (bytesRead == 0) {
+                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                    restartClientsLoop = true;
+                    break;
+                } else {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                        break;
+                    }
+                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                    restartClientsLoop = true;
+                    break;
+                }
+            }
+        }
+
+        if (restartClientsLoop) {
+            it = clients.begin();
+            continue;
+        }
+
+        bool parsed = true;
+        while (parsed) {
+            parsed = false;
+            size_t headerEnd = state.inBuffer.find("\r\n\r\n");
+            size_t sepLen = 4;
+            if (headerEnd == std::string::npos) {
+                headerEnd = state.inBuffer.find("\n\n");
+                sepLen = 2;
+            }
+            if (headerEnd == std::string::npos) {
+                if (state.inBuffer.size() > MAX_HEADER_BYTES) {
+                    HttpResponse resp;
+                    resp.setStatus(431);
+                    serveErrorPage(resp, 431, selectConfig(state.port, ""));
+                    state.keepAlive = false;
+                    state.outBuffer = resp.generateResponse(false);
+                    state.outOffset = 0;
+                    FD_SET(fd, &master_write);
+                }
+                break;
+            }
+
+            size_t bodyStart = headerEnd + sepLen;
+            std::string headerBlock = state.inBuffer.substr(0, headerEnd);
+            std::map<std::string, std::string> headers = parseHeaderMap(headerBlock);
+            std::string hostHeader = headers["host"];
+            bool hasContentLength = headers.find("content-length") != headers.end();
+            size_t contentLength = 0;
+            if (hasContentLength) {
+                std::istringstream iss(headers["content-length"]);
+                iss >> contentLength;
+            }
+            bool isChunked = headers.find("transfer-encoding") != headers.end() &&
+                             headers["transfer-encoding"].find("chunked") != std::string::npos;
+            state.expectContinue = headers.find("expect") != headers.end() &&
+                                   headers["expect"].find("100-continue") != std::string::npos;
+
+            const ConfigParser::ServerConfig& cfg = selectConfig(state.port, hostHeader);
+
+            if (state.expectContinue && !state.sentContinue) {
+                static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                state.outBuffer += std::string(kContinue);
+                state.outOffset = 0;
+                state.sentContinue = true;
+                FD_SET(fd, &master_write);
+            }
+
+            std::string normalizedRequest;
+            size_t consumed = 0;
+            if (isChunked) {
+                size_t consumedEnd = 0;
+                if (!decodeChunkedBody(state.inBuffer, bodyStart, consumedEnd, state.chunkDecoded)) {
+                    break;
+                }
+                std::string reqLine = state.inBuffer.substr(0, state.inBuffer.find("\r\n"));
+                std::string headersOnly = state.inBuffer.substr(state.inBuffer.find("\r\n") + 2, headerEnd - (state.inBuffer.find("\r\n") + 2));
+                std::istringstream hsin(headersOnly);
+                std::string line;
+                std::string rebuiltHeaders;
+                while (std::getline(hsin, line)) {
+                    if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+                    size_t colon = line.find(':');
+                    if (colon == std::string::npos) continue;
+                    std::string lower = toLower(line.substr(0, colon));
+                    if (lower == "transfer-encoding" || lower == "content-length") continue;
+                    rebuiltHeaders += line + "\r\n";
+                }
+                std::ostringstream cl;
+                cl << "Content-Length: " << state.chunkDecoded.size() << "\r\n";
+                rebuiltHeaders += cl.str();
+                normalizedRequest = reqLine + "\r\n" + rebuiltHeaders + "\r\n" + state.chunkDecoded;
+                consumed = consumedEnd;
+                hasContentLength = true;
+                contentLength = state.chunkDecoded.size();
+            } else if (hasContentLength) {
+                size_t have = state.inBuffer.size() > bodyStart ? state.inBuffer.size() - bodyStart : 0;
+                if (have < contentLength) break;
+                consumed = bodyStart + contentLength;
+                normalizedRequest = state.inBuffer.substr(0, consumed);
+            } else {
+                consumed = bodyStart;
+                normalizedRequest = state.inBuffer.substr(0, consumed);
+            }
+
+            try {
+                HttpRequest req;
+                req.parseRequest(normalizedRequest);
+                HttpResponse resp;
+                bool responseReady = false;
+                dispatchRequest(fd, req, resp, cfg, responseReady, state);
+                if (responseReady) {
+                    std::string connHeader = req.getHeader("Connection");
+                    std::string version = req.getVersion();
+                    std::string connLower = toLower(connHeader);
+                    bool keep = false;
+                    if (version == "HTTP/1.1") keep = (connLower != "close");
+                    else keep = (connLower == "keep-alive");
+                    state.keepAlive = keep;
+                    resp.setHeader("Connection", keep ? "keep-alive" : "close");
+                    state.outBuffer += resp.generateResponse(req.getMethod() == "HEAD");
+                    state.outOffset = 0;
+                    FD_SET(fd, &master_write);
+                    if (fd > fdmax) fdmax = fd;
+                }
+            } catch (const std::exception& e) {
+                HttpResponse err;
+                err.setStatus(400);
+                serveErrorPage(err, 400, cfg);
+                state.keepAlive = false;
+                state.outBuffer += err.generateResponse(false);
+                state.outOffset = 0;
+                FD_SET(fd, &master_write);
+            }
+
+            if (consumed >= state.inBuffer.size()) state.inBuffer.clear();
+            else state.inBuffer.erase(0, consumed);
+            state.expectContinue = false;
+            state.sentContinue = false;
+            state.chunkDecoded.clear();
+            parsed = true;
+        }
+
+        ++it;
+    }
+}
+
+void Server::processClientWrites(fd_set& write_fds, fd_set& master_read, fd_set& master_write,
+                                 std::map<int, ClientState>& clients, time_t now) {
+    for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
+        int fd = it->first;
+        ClientState& st = it->second;
+        bool restartClientsLoop = false;
+
+        if (FD_ISSET(fd, &write_fds)) {
+            while (st.outOffset < st.outBuffer.size()) {
+                ssize_t sent = send(fd, st.outBuffer.c_str() + st.outOffset, st.outBuffer.size() - st.outOffset, 0);
+                if (sent > 0) {
+                    st.outOffset += sent;
+                    st.lastActivity = now;
+                } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                } else {
+                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                    restartClientsLoop = true;
+                    break;
+                }
+            }
+            if (restartClientsLoop) { it = clients.begin(); continue; }
+
+            if (st.outOffset >= st.outBuffer.size()) {
+                st.outBuffer.clear();
+                st.outOffset = 0;
+            }
+
+            if (st.fileStream.active && st.outBuffer.empty()) {
+                if (st.fileStream.pendingChunk.empty() && st.fileStream.offset < st.fileStream.size) {
+                    char fbuf[FILE_CHUNK_BYTES];
+                    ssize_t r = read(st.fileStream.fd, fbuf, FILE_CHUNK_BYTES);
+                    if (r > 0) {
+                        st.fileStream.pendingChunk.assign(fbuf, r);
+                        st.fileStream.offset += r;
+                    } else if (r == 0) {
+                        clearFileStream(st.fileStream);
+                    } else {
+                        closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                        restartClientsLoop = true;
+                    }
+                }
+                if (restartClientsLoop) { it = clients.begin(); continue; }
+
+                while (!st.fileStream.pendingChunk.empty()) {
+                    ssize_t sent = send(fd, st.fileStream.pendingChunk.c_str(), st.fileStream.pendingChunk.size(), 0);
+                    if (sent > 0) {
+                        st.fileStream.pendingChunk.erase(0, sent);
+                        st.lastActivity = now;
+                    } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    } else {
+                        closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                        restartClientsLoop = true;
+                        break;
+                    }
+                }
+                if (restartClientsLoop) { it = clients.begin(); continue; }
+
+                if (st.fileStream.pendingChunk.empty() && st.fileStream.offset >= st.fileStream.size) {
+                    clearFileStream(st.fileStream);
+                }
+            }
+
+            if (!needsWrite(st)) {
+                FD_CLR(fd, &master_write);
+                if (!st.keepAlive) {
+                    closeClientFd(fd, master_read, master_write, clients, cgiStates);
+                    restartClientsLoop = true;
+                }
+            }
+        }
+
+        if (restartClientsLoop) {
+            it = clients.begin();
+            continue;
+        }
+
+        ++it;
     }
 }
 
@@ -300,9 +766,6 @@ const ConfigParser::ServerConfig& Server::selectConfig(int port, const std::stri
 
     // 1. Match server_name
     for (size_t i = 0; i < configs.size(); ++i) {
-        // serverName should also be compared case-insensitively, assuming it was parsed/stored as is.
-        // However, conventions usually have it lowercase. To be safe, let's assume serverName might be mixed case too or just compare against lowercased version.
-        // Better: compare lowercased serverName.
         if (toLower(configs[i]->serverName) == hostname) {
              return *configs[i];
         }
@@ -313,120 +776,25 @@ const ConfigParser::ServerConfig& Server::selectConfig(int port, const std::stri
 }
 
 void Server::start() {
-    const int SELECT_TIMEOUT_SEC = 1;
-    const int CLIENT_TIMEOUT_SEC = 30;
-    const int CGI_TIMEOUT_SEC = 120;
-    const size_t MAX_HEADER_BYTES = 32 * 1024;
-    const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024;
-    const size_t FILE_CHUNK_BYTES = 16 * 1024;
-
     std::map<int, ClientState> clients;
 
     try {
-        // 1. Populate portToConfigs map and identify unique ports
         std::set<int> portsToBind;
-        portToConfigs.clear();
+        buildPortMapping(portsToBind);
 
-        if (serverConfigs.empty()) {
-            for (std::vector<std::string>::const_iterator it = currentConfig.listenPorts.begin();
-                 it != currentConfig.listenPorts.end(); ++it) {
-                int port = atoi(it->c_str());
-                if (port > 0 && port <= 65535) {
-                    portsToBind.insert(port);
-                    portToConfigs[port].push_back(&currentConfig);
-                }
-            }
-        } else {
-            for (size_t i = 0; i < serverConfigs.size(); ++i) {
-                for (std::vector<std::string>::const_iterator it = serverConfigs[i].listenPorts.begin();
-                     it != serverConfigs[i].listenPorts.end(); ++it) {
-                    int port = atoi(it->c_str());
-                    if (port > 0 && port <= 65535) {
-                        portsToBind.insert(port);
-                        portToConfigs[port].push_back(&serverConfigs[i]);
-                    }
-                }
-            }
-        }
-
-        // 2. Bind sockets
-        socketPortMap.clear();
-        serverSockets.clear();
-
-        for (std::set<int>::iterator it = portsToBind.begin(); it != portsToBind.end(); ++it) {
-            int port = *it;
-
-            int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-            if (serverSocket < 0) {
-                std::cerr << "Error creating socket for port " << port << ": " << strerror(errno) << std::endl;
-                continue;
-            }
-
-            int flags = fcntl(serverSocket, F_GETFL, 0);
-            if (flags != -1) fcntl(serverSocket, F_SETFL, flags | O_NONBLOCK);
-
-            int optval = 1;
-            if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
-                std::cerr << "Error setting socket options: " << strerror(errno) << std::endl;
-                close(serverSocket);
-                continue;
-            }
-
-            struct sockaddr_in serverAddr;
-            memset(&serverAddr, 0, sizeof(serverAddr));
-            serverAddr.sin_family = AF_INET;
-            serverAddr.sin_addr.s_addr = INADDR_ANY;
-            serverAddr.sin_port = htons(port);
-
-            if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-                std::cerr << "Error binding socket to port " << port << ": " << strerror(errno) << std::endl;
-                close(serverSocket);
-                continue;
-            }
-
-            if (listen(serverSocket, 128) < 0) {
-                std::cerr << "Error listening on socket: " << strerror(errno) << std::endl;
-                close(serverSocket);
-                continue;
-            }
-
-            serverSockets.push_back(serverSocket);
-            socketPortMap[serverSocket] = port;
-            std::cout << "Server is listening on port " << port << std::endl;
-        }
-
-        if (serverSockets.empty()) {
-            std::cerr << "Failed to set up any server sockets. Exiting." << std::endl;
-            return;
-        }
+        if (!bindListeningSockets(portsToBind)) return;
 
         fd_set master_read, master_write;
-        FD_ZERO(&master_read);
-        FD_ZERO(&master_write);
         int fdmax = 0;
-
-        for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
-            FD_SET(*it, &master_read);
-            if (*it > fdmax) fdmax = *it;
-        }
+        initMasterFdSets(master_read, master_write, fdmax);
 
         std::cout << "Server is running. Press Ctrl+C to stop." << std::endl;
 
         while (true) {
-            fd_set read_fds = master_read;
-            fd_set write_fds = master_write;
-            int loopFdMax = fdmax;
-
-            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ++cit) {
-                if (cit->second.pipe_out != -1 && !cit->second.readComplete) {
-                    FD_SET(cit->second.pipe_out, &read_fds);
-                    if (cit->second.pipe_out > loopFdMax) loopFdMax = cit->second.pipe_out;
-                }
-                if (cit->second.pipe_in != -1 && !cit->second.writeComplete) {
-                    FD_SET(cit->second.pipe_in, &write_fds);
-                    if (cit->second.pipe_in > loopFdMax) loopFdMax = cit->second.pipe_in;
-                }
-            }
+            fd_set read_fds;
+            fd_set write_fds;
+            int loopFdMax = 0;
+            buildFdSets(master_read, master_write, read_fds, write_fds, fdmax, loopFdMax);
 
             struct timeval tv;
             tv.tv_sec = SELECT_TIMEOUT_SEC;
@@ -440,344 +808,12 @@ void Server::start() {
 
             time_t now = time(NULL);
 
-            // Client timeouts
-            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
-                if (now - it->second.lastActivity > CLIENT_TIMEOUT_SEC) {
-                    closeClientFd(it->first, master_read, master_write, clients, cgiStates);
-                    it = clients.begin(); // iterator invalidated, restart
-                } else {
-                    ++it;
-                }
-            }
-
-            // CGI timeouts
-            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
-                if (now - cit->second.lastIO > CGI_TIMEOUT_SEC) {
-                    HttpResponse response;
-                    serveErrorPage(response, 504, *cit->second.config);
-                    int clientFd = cit->first;
-                    if (clients.find(clientFd) != clients.end()) {
-                        clients[clientFd].outBuffer = response.generateResponse(cit->second.isHead);
-                        clients[clientFd].outOffset = 0;
-                        FD_SET(clientFd, &master_write);
-                        if (clientFd > fdmax) fdmax = clientFd;
-                    }
-                    cleanupCgi(clientFd, cgiStates);
-                    cit = cgiStates.begin();
-                } else {
-                    ++cit;
-                }
-            }
-
-            // Accept new connections
-            for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) {
-                if (FD_ISSET(*it, &read_fds)) {
-                    while (true) {
-                        struct sockaddr_in clientAddr;
-                        socklen_t clientLen = sizeof(clientAddr);
-                        int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
-                        if (clientSocket < 0) {
-                            if (errno == EWOULDBLOCK || errno == EAGAIN) break;
-                            std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
-                            break;
-                        }
-                        int cflags = fcntl(clientSocket, F_GETFL, 0);
-                        if (cflags != -1) fcntl(clientSocket, F_SETFL, cflags | O_NONBLOCK);
-                        FD_SET(clientSocket, &master_read);
-                        if (clientSocket > fdmax) fdmax = clientSocket;
-                        ClientState cs;
-                        cs.lastActivity = now;
-                        cs.port = socketPortMap[*it];
-                        clients[clientSocket] = cs;
-                    }
-                }
-            }
-
-            // CGI I/O
-            for (std::map<int, CgiState>::iterator cit = cgiStates.begin(); cit != cgiStates.end(); ) {
-                CgiState& cgi = cit->second;
-                int clientFd = cit->first;
-                if (cgi.pipe_in != -1 && FD_ISSET(cgi.pipe_in, &write_fds)) {
-                    handleCgiWrite(clientFd, cgi);
-                }
-                if (cgi.pipe_out != -1 && FD_ISSET(cgi.pipe_out, &read_fds)) {
-                    handleCgiRead(clientFd, cgi);
-                }
-                if (cgi.readComplete) {
-                    int status;
-                    pid_t result = waitpid(cgi.pid, &status, WNOHANG);
-                    if (result != 0) {
-                        std::string response;
-                        finalizeCgiRequest(clientFd, cgi, status, response);
-                        if (clients.find(clientFd) != clients.end()) {
-                            clients[clientFd].outBuffer = response;
-                            clients[clientFd].outOffset = 0;
-                            clients[clientFd].keepAlive = false;
-                            FD_SET(clientFd, &master_write);
-                            if (clientFd > fdmax) fdmax = clientFd;
-                        }
-                        cleanupCgi(clientFd, cgiStates);
-                        cit = cgiStates.begin();
-                        continue;
-                    }
-                }
-                ++cit;
-            }
-
-            // Read from clients
-            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
-                int fd = it->first;
-                ClientState& state = it->second;
-                bool restartClientsLoop = false;
-
-                if (FD_ISSET(fd, &read_fds)) {
-                    char buffer[8192];
-                    while (true) {
-                        ssize_t bytesRead = recv(fd, buffer, sizeof(buffer), 0);
-                        if (bytesRead > 0) {
-                            state.inBuffer.append(buffer, bytesRead);
-                            state.lastActivity = now;
-                            if (state.inBuffer.size() > MAX_REQUEST_BYTES) {
-                                HttpResponse resp;
-                                resp.setStatus(413);
-                                serveErrorPage(resp, 413, selectConfig(state.port, ""));
-                                state.keepAlive = false;
-                                state.outBuffer = resp.generateResponse(false);
-                                state.outOffset = 0;
-                                FD_SET(fd, &master_write);
-                                break;
-                            }
-                        } else if (bytesRead == 0) {
-                            // Client closed the connection
-                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                            restartClientsLoop = true;
-                            break;
-                        } else {
-                            // For non-blocking sockets, EAGAIN/EWOULDBLOCK just mean "no more data"
-                            if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                                break;
-                            }
-                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                            restartClientsLoop = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (restartClientsLoop) {
-                    it = clients.begin();
-                    continue;
-                }
-
-                // Attempt to parse complete requests
-                bool parsed = true;
-                while (parsed) {
-                    parsed = false;
-                    size_t headerEnd = state.inBuffer.find("\r\n\r\n");
-                    size_t sepLen = 4;
-                    if (headerEnd == std::string::npos) {
-                        headerEnd = state.inBuffer.find("\n\n");
-                        sepLen = 2;
-                    }
-                    if (headerEnd == std::string::npos) {
-                        if (state.inBuffer.size() > MAX_HEADER_BYTES) {
-                            HttpResponse resp;
-                            resp.setStatus(431);
-                            serveErrorPage(resp, 431, selectConfig(state.port, ""));
-                            state.keepAlive = false;
-                            state.outBuffer = resp.generateResponse(false);
-                            state.outOffset = 0;
-                            FD_SET(fd, &master_write);
-                        }
-                        break;
-                    }
-
-                    size_t bodyStart = headerEnd + sepLen;
-                    std::string headerBlock = state.inBuffer.substr(0, headerEnd);
-                    std::map<std::string, std::string> headers = parseHeaderMap(headerBlock);
-                    std::string hostHeader = headers["host"];
-                    bool hasContentLength = headers.find("content-length") != headers.end();
-                    size_t contentLength = 0;
-                    if (hasContentLength) {
-                        std::istringstream iss(headers["content-length"]);
-                        iss >> contentLength;
-                    }
-                    bool isChunked = headers.find("transfer-encoding") != headers.end() &&
-                                     headers["transfer-encoding"].find("chunked") != std::string::npos;
-                    state.expectContinue = headers.find("expect") != headers.end() &&
-                                           headers["expect"].find("100-continue") != std::string::npos;
-
-                    const ConfigParser::ServerConfig& cfg = selectConfig(state.port, hostHeader);
-
-                    if (state.expectContinue && !state.sentContinue) {
-                        static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
-                        state.outBuffer += std::string(kContinue);
-                        state.outOffset = 0;
-                        state.sentContinue = true;
-                        FD_SET(fd, &master_write);
-                    }
-
-                    std::string normalizedRequest;
-                    size_t consumed = 0;
-                    if (isChunked) {
-                        size_t consumedEnd = 0;
-                        if (!decodeChunkedBody(state.inBuffer, bodyStart, consumedEnd, state.chunkDecoded)) {
-                            break;
-                        }
-                        std::string reqLine = state.inBuffer.substr(0, state.inBuffer.find("\r\n"));
-                        std::string headersOnly = state.inBuffer.substr(state.inBuffer.find("\r\n") + 2, headerEnd - (state.inBuffer.find("\r\n") + 2));
-                        std::istringstream hsin(headersOnly);
-                        std::string line;
-                        std::string rebuiltHeaders;
-                        while (std::getline(hsin, line)) {
-                            if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-                            size_t colon = line.find(':');
-                            if (colon == std::string::npos) continue;
-                            std::string lower = toLower(line.substr(0, colon));
-                            if (lower == "transfer-encoding" || lower == "content-length") continue;
-                            rebuiltHeaders += line + "\r\n";
-                        }
-                        std::ostringstream cl;
-                        cl << "Content-Length: " << state.chunkDecoded.size() << "\r\n";
-                        rebuiltHeaders += cl.str();
-                        normalizedRequest = reqLine + "\r\n" + rebuiltHeaders + "\r\n" + state.chunkDecoded;
-                        consumed = consumedEnd;
-                        hasContentLength = true;
-                        contentLength = state.chunkDecoded.size();
-                    } else if (hasContentLength) {
-                        size_t have = state.inBuffer.size() > bodyStart ? state.inBuffer.size() - bodyStart : 0;
-                        if (have < contentLength) break;
-                        consumed = bodyStart + contentLength;
-                        normalizedRequest = state.inBuffer.substr(0, consumed);
-                    } else {
-                        consumed = bodyStart;
-                        normalizedRequest = state.inBuffer.substr(0, consumed);
-                    }
-
-                    try {
-                        HttpRequest req;
-                        req.parseRequest(normalizedRequest);
-                        HttpResponse resp;
-                        bool responseReady = false;
-                        dispatchRequest(fd, req, resp, cfg, responseReady, state);
-                        if (responseReady) {
-                            std::string connHeader = req.getHeader("Connection");
-                            std::string version = req.getVersion();
-                            std::string connLower = toLower(connHeader);
-                            bool keep = false;
-                            if (version == "HTTP/1.1") keep = (connLower != "close");
-                            else keep = (connLower == "keep-alive");
-                            state.keepAlive = keep;
-                            resp.setHeader("Connection", keep ? "keep-alive" : "close");
-                            state.outBuffer += resp.generateResponse(req.getMethod() == "HEAD");
-                            state.outOffset = 0;
-                            FD_SET(fd, &master_write);
-                            if (fd > fdmax) fdmax = fd;
-                        }
-                    } catch (const std::exception& e) {
-                        HttpResponse err;
-                        err.setStatus(400);
-                        serveErrorPage(err, 400, cfg);
-                        state.keepAlive = false;
-                        state.outBuffer += err.generateResponse(false);
-                        state.outOffset = 0;
-                        FD_SET(fd, &master_write);
-                    }
-
-                    if (consumed >= state.inBuffer.size()) state.inBuffer.clear();
-                    else state.inBuffer.erase(0, consumed);
-                    state.expectContinue = false;
-                    state.sentContinue = false;
-                    state.chunkDecoded.clear();
-                    parsed = true;
-                }
-
-                ++it;
-            }
-
-            // Write to clients
-            for (std::map<int, ClientState>::iterator it = clients.begin(); it != clients.end(); ) {
-                int fd = it->first;
-                ClientState& st = it->second;
-                bool restartClientsLoop = false;
-
-                if (FD_ISSET(fd, &write_fds)) {
-                    // Send buffered response bytes
-                    while (st.outOffset < st.outBuffer.size()) {
-                        ssize_t sent = send(fd, st.outBuffer.c_str() + st.outOffset, st.outBuffer.size() - st.outOffset, 0);
-                        if (sent > 0) {
-                            st.outOffset += sent;
-                            st.lastActivity = now;
-                        } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
-                            // Not ready to send more; try again on next loop
-                            break;
-                        } else {
-                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                            restartClientsLoop = true;
-                            break;
-                        }
-                    }
-                    if (restartClientsLoop) { it = clients.begin(); continue; }
-
-                    if (st.outOffset >= st.outBuffer.size()) {
-                        st.outBuffer.clear();
-                        st.outOffset = 0;
-                    }
-
-                    // Stream file if needed
-                    if (st.fileStream.active && st.outBuffer.empty()) {
-                        if (st.fileStream.pendingChunk.empty() && st.fileStream.offset < st.fileStream.size) {
-                            char fbuf[FILE_CHUNK_BYTES];
-                            ssize_t r = read(st.fileStream.fd, fbuf, FILE_CHUNK_BYTES);
-                            if (r > 0) {
-                                st.fileStream.pendingChunk.assign(fbuf, r);
-                                st.fileStream.offset += r;
-                            } else if (r == 0) {
-                                clearFileStream(st.fileStream);
-                            } else {
-                                closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                                restartClientsLoop = true;
-                            }
-                        }
-                        if (restartClientsLoop) { it = clients.begin(); continue; }
-
-                        while (!st.fileStream.pendingChunk.empty()) {
-                            ssize_t sent = send(fd, st.fileStream.pendingChunk.c_str(), st.fileStream.pendingChunk.size(), 0);
-                            if (sent > 0) {
-                                st.fileStream.pendingChunk.erase(0, sent);
-                                st.lastActivity = now;
-                            } else if (sent == 0 || errno == EAGAIN || errno == EWOULDBLOCK) {
-                                // Socket not ready for more; try later
-                                break;
-                            } else {
-                                closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                                restartClientsLoop = true;
-                                break;
-                            }
-                        }
-                        if (restartClientsLoop) { it = clients.begin(); continue; }
-
-                        if (st.fileStream.pendingChunk.empty() && st.fileStream.offset >= st.fileStream.size) {
-                            clearFileStream(st.fileStream);
-                        }
-                    }
-
-                    if (!needsWrite(st)) {
-                        FD_CLR(fd, &master_write);
-                        if (!st.keepAlive) {
-                            closeClientFd(fd, master_read, master_write, clients, cgiStates);
-                            restartClientsLoop = true;
-                        }
-                    }
-                }
-
-                if (restartClientsLoop) {
-                    it = clients.begin();
-                    continue;
-                }
-
-                ++it;
-            }
+            handleClientTimeouts(clients, master_read, master_write, now);
+            handleCgiTimeouts(clients, master_write, fdmax, now);
+            acceptConnections(master_read, fdmax, clients, now);
+            processCgiIo(read_fds, write_fds, master_write, fdmax, clients);
+            processClientReads(read_fds, master_read, master_write, fdmax, clients, now);
+            processClientWrites(write_fds, master_read, master_write, clients, now);
         }
 
         for (std::vector<int>::const_iterator it = serverSockets.begin(); it != serverSockets.end(); ++it) { close(*it); }
