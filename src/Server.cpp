@@ -233,7 +233,8 @@ void Server::acceptConnections(fd_set& master_read, int& fdmax,
                 socklen_t clientLen = sizeof(clientAddr);
                 int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
                 if (clientSocket < 0) {
-                    std::cerr << "Error accepting connection" << std::endl;
+                    // Non-blocking accept has no more queued connections; log once and exit the loop
+                    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
                     break;
                 }
                 int cflags = fcntl(clientSocket, F_GETFL, 0);
@@ -318,7 +319,8 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
                     closed = true;
                     break;
                 } else {
-                    break; // No bytes and no close; try again when selectable
+                    // On non-blocking sockets, a negative read here simply defers to the next select cycle
+                    break;
                 }
             }
         }
