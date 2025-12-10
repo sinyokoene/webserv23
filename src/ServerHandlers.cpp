@@ -73,38 +73,37 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
     if (!locConfig.getRedirect().empty()) {
         response.setStatus(301); // Moved Permanently
         response.setHeader("Location", locConfig.getRedirect());
-        response.setBody("<html><body><h1>301 Permanent Doorgestuurd</h1><p>Het document is verplaatst naar <a href=\"" + 
+        response.setBody("<html><body><h1>301 Moved Permanently</h1><p>The document has moved to <a href=\"" +
                         locConfig.getRedirect() + "\">" + locConfig.getRedirect() + "</a></p></body></html>");
         return;
     }
 
-    // Los het bestandspad op
+    // Resolve the request path
     std::string resolvedPath = resolvePath(config, effectiveRoot, request.getPath());
     if (resolvedPath.empty()) {
-        response.setStatus(403); // Verboden
+        response.setStatus(403); // Forbidden
         serveErrorPage(response, 403, config);
         return;
     }
 
     struct stat st;
     if (stat(resolvedPath.c_str(), &st) != 0) {
-        response.setStatus(404); // Niet Gevonden
+        response.setStatus(404); // Not Found
         serveErrorPage(response, 404, config);
         return;
     }
 
     if (S_ISDIR(st.st_mode)) {
-        // Directory handling without forcing a trailing-slash redirect
-        // Try to find an index file first
+        // Directory handling without forcing a trailing-slash redirect; try an index file first
         std::vector<std::string> indexFiles = config.indexFiles;
         std::string index = locConfig.getIndex();
         if (!index.empty() && std::find(indexFiles.begin(), indexFiles.end(), index) == indexFiles.end()) {
-            indexFiles.insert(indexFiles.begin(), index);  // Prioriteit voor locatie-specifieke index
+            indexFiles.insert(indexFiles.begin(), index);
         }
         
-        // Only fallback to index.html if autoindex is OFF
+        // Fallback to index.html only if autoindex is off
         if (indexFiles.empty() && !locConfig.getAutoindex()) {
-            indexFiles.push_back("index.html");  // Standaard fallback only if autoindex is OFF
+            indexFiles.push_back("index.html");
         }
 
         std::string indexPath;
@@ -117,7 +116,6 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
         }
 
         if (!indexPath.empty()) {
-            // Serve the index file
             std::ifstream file(indexPath.c_str(), std::ios::binary);
             if (file) {
                 std::ostringstream ss;
@@ -131,10 +129,9 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
             response.setHeader("Content-Type", HttpResponse::getMimeType(indexPath));
             if (isHead) { setContentLengthFromFile(response, indexPath); }
         } else if (locConfig.getAutoindex()) {
-            // Generate directory listing
             DIR *dir = opendir(resolvedPath.c_str());
-            std::string html = "<!DOCTYPE html><html><head><title>Index van " + 
-                             request.getPath() + "</title></head><body><h1>Index van " + 
+            std::string html = "<!DOCTYPE html><html><head><title>Index of " +
+                             request.getPath() + "</title></head><body><h1>Index of " +
                              request.getPath() + "</h1><ul>";
             
             if (dir) {
@@ -199,7 +196,6 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
             }
         }
     } else {
-        // Niet een map of regulier bestand
         response.setStatus(403);
         serveErrorPage(response, 403, config);
     }
@@ -230,10 +226,9 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
         // Check if the upload directory exists, if not, try to create it
         struct stat st;
         if (stat(uploadDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-            // Try to create the upload directory
             if (mkdir(uploadDir.c_str(), 0755) != 0 && errno != EEXIST) {
                 std::cerr << "Could not create upload directory: " << uploadDir << " error: " << strerror(errno) << std::endl;
-                response.setStatus(500); // Interne Serverfout
+                response.setStatus(500);
                 serveErrorPage(response, 500, config);
                 return;
             }
@@ -300,7 +295,7 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
                     if (nextMark == std::string::npos) break;
                     size_t contentEnd = nextMark;
                     // Exclude trailing CRLF if present
-                    if (contentEnd >= 2 && body[contentEnd-2] == '\r' && body[contentEnd-1] == '\n') contentEnd -= 2;
+                if (contentEnd >= 2 && body[contentEnd-2] == '\r' && body[contentEnd-1] == '\n') contentEnd -= 2;
 
                     if (!filename.empty()) {
                         savedFilename = filename;
@@ -356,16 +351,14 @@ void Server::handlePostRequest(HttpRequest& request, HttpResponse& response,
             outFile.close();
         }
 
-        // Success response
         response.setStatus(201);
         response.setBody("<html><body><h1>File uploaded successfully to " + fullPath + "</h1></body></html>");
         response.setHeader("Content-Type", "text/html");
         std::string requestPath = request.getPath();
         response.setHeader("Location", requestPath + (requestPath.empty() || requestPath[requestPath.length()-1] == '/' ? "" : "/") + savedFilename);
     } else {
-        // POST niet geconfigureerd voor deze locatie
-        response.setStatus(405); // Methode Niet Toegestaan
-        response.setHeader("Allow", "GET, HEAD, OPTIONS"); // Aanpassen op basis van getAllowedMethodsForPath
+        response.setStatus(405); // Method Not Allowed
+        response.setHeader("Allow", "GET, HEAD, OPTIONS");
         serveErrorPage(response, 405, config);
     }
 }
@@ -444,13 +437,11 @@ void Server::handleDeleteRequest(HttpRequest& request, HttpResponse& response,
 // Handler for OPTIONS requests
 void Server::handleOptionsRequest(HttpRequest& request, HttpResponse& response, 
                                  const ConfigParser::ServerConfig& config) {
-    // Verkrijg toegestane methoden voor dit pad
     std::set<std::string> allowedMethods = getAllowedMethodsForPath(request.getPath(), config);
     
     // Zorg ervoor dat OPTIONS is opgenomen in de toegestane methoden
     allowedMethods.insert("OPTIONS");
 
-    // Stel respons in
     response.setStatus(200); // OK
     response.setAllowHeader(allowedMethods);
     
@@ -459,7 +450,7 @@ void Server::handleOptionsRequest(HttpRequest& request, HttpResponse& response,
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD");
     response.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Filename, Authorization");
     
-    response.setHeader("Content-Length", "0"); // OPTIONS heeft geen body
+    response.setHeader("Content-Length", "0");
     response.setBody("");
 }
 

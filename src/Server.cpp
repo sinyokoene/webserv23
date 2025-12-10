@@ -184,9 +184,8 @@ void Server::acceptConnections(fd_set& master_read, int& fdmax,
                 socklen_t clientLen = sizeof(clientAddr);
                 int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
                 if (clientSocket < 0) {
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
-                    }
+                    // Non-blocking accept has no more queued connections; log once and exit the loop
+                    std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
                     break;
                 }
                 int cflags = fcntl(clientSocket, F_GETFL, 0);
@@ -271,7 +270,8 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
                     closed = true;
                     break;
                 } else {
-                    break; // No bytes and no close; try again when selectable
+                    // On non-blocking sockets, a negative read here simply defers to the next select cycle
+                    break;
                 }
             }
         }
@@ -732,6 +732,12 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
     std::string effectiveRoot = locConfig.getRoot().empty() ? config.root : locConfig.getRoot();
     std::string path = request.getPath();
 
+    // OPTIONS should always return an Allow header with 200
+    if (request.getMethod() == "OPTIONS") {
+        handleOptionsRequest(request, response, config);
+        return;
+    }
+
     // Handle CGI requests
     if (locConfig.isCgiPath(path) && (request.getMethod() == "POST" || request.getMethod() == "GET" || request.getMethod() == "HEAD")) {
         std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot() : config.root;
@@ -765,8 +771,6 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
         handlePutRequest(request, response, config, locConfig, effectiveRoot);
     } else if (request.getMethod() == "DELETE") {
         handleDeleteRequest(request, response, config, locConfig, effectiveRoot);
-    } else if (request.getMethod() == "OPTIONS") {
-        handleOptionsRequest(request, response, config);
     } else {
         response.setStatus(501); 
         serveErrorPage(response, 501, config);
