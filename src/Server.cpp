@@ -10,23 +10,6 @@ static const size_t MAX_REQUEST_BYTES = 200 * 1024 * 1024;
 static const size_t FILE_CHUNK_BYTES = 16 * 1024;
 
 // ---- internal helpers ----------------------------------------------------
-static std::map<std::string, std::string> parseHeaderMap(const std::string& headerBlock) {
-    std::map<std::string, std::string> headers;
-    std::istringstream hs(headerBlock);
-    std::string line;
-    while (std::getline(hs, line)) {
-        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-        size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;
-        std::string name = toLower(line.substr(0, colon));
-        std::string value = line.substr(colon + 1);
-        size_t first = value.find_first_not_of(" \t");
-        size_t last = value.find_last_not_of(" \t");
-        if (first != std::string::npos) value = value.substr(first, last - first + 1); else value = "";
-        headers[name] = value;
-    }
-    return headers;
-}
 
 static bool needsWrite(const ClientState& st) {
     if (st.outOffset < st.outBuffer.size()) return true;
@@ -45,38 +28,6 @@ static void clearFileStream(FileStreamState& fs) {
     fs.active = false;
     fs.isHead = false;
     fs.pendingChunk.clear();
-}
-
-static bool decodeChunkedBody(const std::string& data, size_t startPos, size_t& consumed, std::string& out) {
-    size_t pos = startPos;
-    out.clear();
-    while (true) {
-        size_t lineEnd = data.find("\r\n", pos);
-        if (lineEnd == std::string::npos) return false;
-        std::string sizeLine = data.substr(pos, lineEnd - pos);
-        size_t sc = sizeLine.find(';');
-        if (sc != std::string::npos) sizeLine = sizeLine.substr(0, sc);
-        size_t f = sizeLine.find_first_not_of(" \t");
-        size_t l = sizeLine.find_last_not_of(" \t");
-        if (f == std::string::npos) return false;
-        sizeLine = sizeLine.substr(f, l - f + 1);
-        unsigned long chunkSize = 0;
-        std::istringstream xs(sizeLine);
-        xs >> std::hex >> chunkSize;
-        if (xs.fail()) return false;
-        pos = lineEnd + 2;
-        if (chunkSize == 0) {
-            size_t trailerEnd = data.find("\r\n", pos);
-            if (trailerEnd == std::string::npos) return false;
-            consumed = trailerEnd + 2;
-            return true;
-        }
-        if (data.size() < pos + chunkSize + 2) return false;
-        out.append(data, pos, chunkSize);
-        pos += chunkSize;
-        if (!(data[pos] == '\r' && data[pos + 1] == '\n')) return false;
-        pos += 2;
-    }
 }
 
 static void cleanupCgi(int fd, std::map<int, CgiState>& cgiStates);
@@ -233,7 +184,9 @@ void Server::acceptConnections(fd_set& master_read, int& fdmax,
                 socklen_t clientLen = sizeof(clientAddr);
                 int clientSocket = accept(*it, (struct sockaddr*)&clientAddr, &clientLen);
                 if (clientSocket < 0) {
-                    std::cerr << "Error accepting connection" << std::endl;
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        std::cerr << "Error accepting connection: " << strerror(errno) << std::endl;
+                    }
                     break;
                 }
                 int cflags = fcntl(clientSocket, F_GETFL, 0);
@@ -349,7 +302,7 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
 
             size_t bodyStart = headerEnd + sepLen;
             std::string headerBlock = state.inBuffer.substr(0, headerEnd);
-            std::map<std::string, std::string> headers = parseHeaderMap(headerBlock);
+            std::map<std::string, std::string> headers = HttpRequest::parseHeaders(headerBlock);
             std::string hostHeader = headers["host"];
             bool hasContentLength = headers.find("content-length") != headers.end();
             size_t contentLength = 0;
@@ -365,8 +318,9 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
             const ConfigParser::ServerConfig& cfg = selectConfig(state.port, hostHeader);
 
             if (state.expectContinue && !state.sentContinue) {
-                static const char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
-                state.outBuffer += std::string(kContinue);
+                HttpResponse continueResp;
+                continueResp.setStatus(100);
+                state.outBuffer += continueResp.generateResponse(false);
                 state.outOffset = 0;
                 state.sentContinue = true;
                 FD_SET(fd, &master_write);
@@ -376,29 +330,11 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
             size_t consumed = 0;
             if (isChunked) {
                 size_t consumedEnd = 0;
-                if (!decodeChunkedBody(state.inBuffer, bodyStart, consumedEnd, state.chunkDecoded)) {
+                if (!HttpRequest::decodeChunkedBody(state.inBuffer, bodyStart, consumedEnd, state.chunkDecoded)) {
                     break;
                 }
-                std::string reqLine = state.inBuffer.substr(0, state.inBuffer.find("\r\n"));
-                std::string headersOnly = state.inBuffer.substr(state.inBuffer.find("\r\n") + 2, headerEnd - (state.inBuffer.find("\r\n") + 2));
-                std::istringstream hsin(headersOnly);
-                std::string line;
-                std::string rebuiltHeaders;
-                while (std::getline(hsin, line)) {
-                    if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
-                    size_t colon = line.find(':');
-                    if (colon == std::string::npos) continue;
-                    std::string lower = toLower(line.substr(0, colon));
-                    if (lower == "transfer-encoding" || lower == "content-length") continue;
-                    rebuiltHeaders += line + "\r\n";
-                }
-                std::ostringstream cl;
-                cl << "Content-Length: " << state.chunkDecoded.size() << "\r\n";
-                rebuiltHeaders += cl.str();
-                normalizedRequest = reqLine + "\r\n" + rebuiltHeaders + "\r\n" + state.chunkDecoded;
+                normalizedRequest = HttpRequest::normalizeChunkedRequest(state.inBuffer, headerEnd, state.chunkDecoded);
                 consumed = consumedEnd;
-                hasContentLength = true;
-                contentLength = state.chunkDecoded.size();
             } else if (hasContentLength) {
                 size_t have = state.inBuffer.size() > bodyStart ? state.inBuffer.size() - bodyStart : 0;
                 if (have < contentLength) break;
@@ -416,14 +352,8 @@ void Server::processClientReads(fd_set& read_fds, fd_set& master_read, fd_set& m
                 bool responseReady = false;
                 dispatchRequest(fd, req, resp, cfg, responseReady, state);
                 if (responseReady) {
-                    std::string connHeader = req.getHeader("Connection");
-                    std::string version = req.getVersion();
-                    std::string connLower = toLower(connHeader);
-                    bool keep = false;
-                    if (version == "HTTP/1.1") keep = (connLower != "close");
-                    else keep = (connLower == "keep-alive");
-                    state.keepAlive = keep;
-                    resp.setHeader("Connection", keep ? "keep-alive" : "close");
+                    state.keepAlive = req.wantsKeepAlive();
+                    resp.setHeader("Connection", state.keepAlive ? "keep-alive" : "close");
                     state.outBuffer += resp.generateResponse(req.getMethod() == "HEAD");
                     state.outOffset = 0;
                     FD_SET(fd, &master_write);
@@ -700,8 +630,7 @@ void Server::serveErrorPage(HttpResponse& response, int statusCode, const Config
         }
     }
     response.setStatus(statusCode);
-    response.setBody("<html><body><h1>" + response.getStatusMessage(response.getStatus()) + "</h1></body></html>");
-    response.setHeader("Content-Type", "text/html");
+    response.setDefaultErrorBody();
 }
 
 std::set<std::string> Server::getAllowedMethodsForPath(const std::string& path, const ConfigParser::ServerConfig& config) const {
@@ -802,15 +731,9 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
     const LocationConfig& locConfig = findLocationConfig(config, request.getPath());
     std::string effectiveRoot = locConfig.getRoot().empty() ? config.root : locConfig.getRoot();
     std::string path = request.getPath();
-    bool isCgiRequest =
-        path.find("/cgi-bin/") != std::string::npos ||
-        path.find(".php") != std::string::npos ||
-        path.find(".py")  != std::string::npos ||
-        path.find(".cgi") != std::string::npos ||
-        !locConfig.getCgiPass().empty();
 
     // Handle CGI requests
-    if (isCgiRequest && (request.getMethod() == "POST" || request.getMethod() == "GET" || request.getMethod() == "HEAD")) {
+    if (locConfig.isCgiPath(path) && (request.getMethod() == "POST" || request.getMethod() == "GET" || request.getMethod() == "HEAD")) {
         std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot() : config.root;
         bool isHead = (request.getMethod() == "HEAD");
         bool cgiStarted = startCgiRequest(clientFd, request, config, locConfig, cgiEffectiveRoot, isHead);
@@ -828,15 +751,7 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
     std::set<std::string> allowedMethods = getAllowedMethodsForPath(request.getPath(), config);
     if (allowedMethods.find(request.getMethod()) == allowedMethods.end()) {
         response.setStatus(405); 
-        std::string allowHeader = "";
-        for (std::set<std::string>::const_iterator it = allowedMethods.begin(); 
-             it != allowedMethods.end(); ++it) {
-            if (it != allowedMethods.begin()) {
-                allowHeader += ", ";
-            }
-            allowHeader += *it;
-        }
-        response.setHeader("Allow", allowHeader);
+        response.setAllowHeader(allowedMethods);
         serveErrorPage(response, 405, config);
         return;
     }
@@ -858,24 +773,3 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
     }
 }
 
-std::string Server::getMimeType(const std::string& path) const {
-    size_t dotPos = path.find_last_of(".");
-    if (dotPos == std::string::npos) {
-        return "application/octet-stream"; 
-    }
-    std::string ext = path.substr(dotPos + 1);
-    
-    if (ext == "html" || ext == "htm") return "text/html";
-    if (ext == "css") return "text/css";
-    if (ext == "js") return "text/javascript";
-    if (ext == "txt") return "text/plain";
-    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
-    if (ext == "png") return "image/png";
-    if (ext == "gif") return "image/gif";
-    if (ext == "svg") return "image/svg+xml";
-    if (ext == "ico") return "image/x-icon";
-    if (ext == "pdf") return "application/pdf";
-    if (ext == "json") return "application/json";
-    if (ext == "xml") return "application/xml";
-    return "application/octet-stream";
-}

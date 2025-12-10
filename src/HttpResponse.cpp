@@ -53,6 +53,7 @@ std::string HttpResponse::getStatusMessage(int statusCode) {
         case 431: return "Request Header Fields Too Large";
         case 501: return "Not Implemented";
         case 502: return "Bad Gateway";
+        case 100: return "Continue";
         default: return "Unknown";
     }
 }
@@ -67,4 +68,40 @@ bool HttpResponse::hasHeader(const std::string& key) const {
 
 const std::string& HttpResponse::getBody() const {
     return body;
+}
+
+std::string HttpResponse::getMimeType(const std::string& path) {
+    size_t dotPos = path.find_last_of(".");
+    if (dotPos == std::string::npos) {
+        return "application/octet-stream"; 
+    }
+    std::string ext = path.substr(dotPos + 1);
+    
+    if (ext == "html" || ext == "htm") return "text/html";
+    if (ext == "css") return "text/css";
+    if (ext == "js") return "text/javascript";
+    if (ext == "txt") return "text/plain";
+    if (ext == "jpg" || ext == "jpeg") return "image/jpeg";
+    if (ext == "png") return "image/png";
+    if (ext == "gif") return "image/gif";
+    if (ext == "svg") return "image/svg+xml";
+    if (ext == "ico") return "image/x-icon";
+    if (ext == "pdf") return "application/pdf";
+    if (ext == "json") return "application/json";
+    if (ext == "xml") return "application/xml";
+    return "application/octet-stream";
+}
+
+void HttpResponse::setDefaultErrorBody() {
+    body = "<html><body><h1>" + getStatusMessage(statusCode) + "</h1></body></html>";
+    setHeader("Content-Type", "text/html");
+}
+
+void HttpResponse::setAllowHeader(const std::set<std::string>& methods) {
+    std::string allowHeader;
+    for (std::set<std::string>::const_iterator it = methods.begin(); it != methods.end(); ++it) {
+        if (!allowHeader.empty()) allowHeader += ", ";
+        allowHeader += *it;
+    }
+    setHeader("Allow", allowHeader);
 }

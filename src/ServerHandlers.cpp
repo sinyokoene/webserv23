@@ -128,7 +128,7 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
                 }
             }
             response.setStatus(200);
-            response.setHeader("Content-Type", getMimeType(indexPath));
+            response.setHeader("Content-Type", HttpResponse::getMimeType(indexPath));
             if (isHead) { setContentLengthFromFile(response, indexPath); }
         } else if (locConfig.getAutoindex()) {
             // Generate directory listing
@@ -167,7 +167,7 @@ void Server::handleGetHeadRequest(HttpRequest& request, HttpResponse& response,
     } else if (S_ISREG(st.st_mode)) {
         // Regular file handling
         response.setStatus(200);
-        response.setHeader("Content-Type", getMimeType(resolvedPath));
+        response.setHeader("Content-Type", HttpResponse::getMimeType(resolvedPath));
         std::ostringstream sizeStr; sizeStr << st.st_size; response.setHeader("Content-Length", sizeStr.str());
         if (!isHead && static_cast<size_t>(st.st_size) > INLINE_LIMIT) {
             int fd = open(resolvedPath.c_str(), O_RDONLY);
@@ -447,22 +447,12 @@ void Server::handleOptionsRequest(HttpRequest& request, HttpResponse& response,
     // Verkrijg toegestane methoden voor dit pad
     std::set<std::string> allowedMethods = getAllowedMethodsForPath(request.getPath(), config);
     
-    // Bouw Allow-header
-    std::string allowHeaderVal;
-    for (std::set<std::string>::const_iterator it = allowedMethods.begin(); it != allowedMethods.end(); ++it) {
-        if (!allowHeaderVal.empty()) allowHeaderVal += ", ";
-        allowHeaderVal += *it;
-    }
-    
     // Zorg ervoor dat OPTIONS is opgenomen in de toegestane methoden
-    if (allowHeaderVal.find("OPTIONS") == std::string::npos) {
-        if (!allowHeaderVal.empty()) allowHeaderVal += ", ";
-        allowHeaderVal += "OPTIONS";
-    }
+    allowedMethods.insert("OPTIONS");
 
     // Stel respons in
     response.setStatus(200); // OK
-    response.setHeader("Allow", allowHeaderVal);
+    response.setAllowHeader(allowedMethods);
     
     // Add CORS headers
     response.setHeader("Access-Control-Allow-Origin", "*");

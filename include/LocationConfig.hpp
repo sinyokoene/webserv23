@@ -36,6 +36,8 @@ public:
     void setUploadStore(const std::string& uploadStore);
     std::string getUploadStore() const;
 
+    bool isCgiPath(const std::string& requestPath) const;
+
 private:
     std::string path;
     std::string root;

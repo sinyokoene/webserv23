@@ -83,3 +83,12 @@ void LocationConfig::setRedirect(const std::string& redirect) {
 std::string LocationConfig::getRedirect() const {
     return this->redirect;
 }
+
+bool LocationConfig::isCgiPath(const std::string& requestPath) const {
+    if (!cgiPass.empty()) return true;
+    if (requestPath.find("/cgi-bin/") != std::string::npos) return true;
+    if (requestPath.find(".php") != std::string::npos) return true;
+    if (requestPath.find(".py") != std::string::npos) return true;
+    if (requestPath.find(".cgi") != std::string::npos) return true;
+    return false;
+}

@@ -40,20 +40,13 @@ void HttpRequest::parseRequest(const std::string& request) {
     }
 
     // Remaining lines in headSection are headers
-    std::string headerLine;
-    while (std::getline(hs, headerLine)) {
-        if (!headerLine.empty() && headerLine[headerLine.size()-1] == '\r') headerLine.erase(headerLine.size()-1);
-        if (headerLine.empty()) break;
-        size_t colonPos = headerLine.find(':');
-        if (colonPos != std::string::npos) {
-            std::string key = headerLine.substr(0, colonPos);
-            std::string value = headerLine.substr(colonPos + 1);
-            // trim leading space
-            size_t first = value.find_first_not_of(" \t");
-            if (first != std::string::npos) value = value.substr(first); else value.clear();
-            // normalize header names to lowercase for case-insensitive access
-            headers[toLower(key)] = value;
-        }
+    std::string headersBlock;
+    // We need to pass the rest of the stream to parseHeaders, or extract the string.
+    // Since we already have the string in headSection, we can just find the first newline and substring.
+    size_t firstNewline = headSection.find('\n');
+    if (firstNewline != std::string::npos) {
+         headersBlock = headSection.substr(firstNewline + 1);
+         headers = parseHeaders(headersBlock);
     }
 
     // Exact body bytes after header separator
@@ -62,6 +55,24 @@ void HttpRequest::parseRequest(const std::string& request) {
     } else {
         body.clear();
     }
+}
+
+std::map<std::string, std::string> HttpRequest::parseHeaders(const std::string& headerBlock) {
+    std::map<std::string, std::string> headers;
+    std::istringstream hs(headerBlock);
+    std::string line;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string name = toLower(line.substr(0, colon));
+        std::string value = line.substr(colon + 1);
+        size_t first = value.find_first_not_of(" \t");
+        size_t last = value.find_last_not_of(" \t");
+        if (first != std::string::npos) value = value.substr(first, last - first + 1); else value = "";
+        headers[name] = value;
+    }
+    return headers;
 }
 
 std::string HttpRequest::getMethod() const {
@@ -100,4 +111,65 @@ std::string HttpRequest::getQueryString() const {
 
 const std::map<std::string, std::string>& HttpRequest::getHeaders() const {
     return headers;
+}
+
+bool HttpRequest::decodeChunkedBody(const std::string& data, size_t startPos, size_t& consumed, std::string& out) {
+    size_t pos = startPos;
+    out.clear();
+    while (true) {
+        size_t lineEnd = data.find("\r\n", pos);
+        if (lineEnd == std::string::npos) return false;
+        std::string sizeLine = data.substr(pos, lineEnd - pos);
+        size_t sc = sizeLine.find(';');
+        if (sc != std::string::npos) sizeLine = sizeLine.substr(0, sc);
+        size_t f = sizeLine.find_first_not_of(" \t");
+        size_t l = sizeLine.find_last_not_of(" \t");
+        if (f == std::string::npos) return false;
+        sizeLine = sizeLine.substr(f, l - f + 1);
+        unsigned long chunkSize = 0;
+        std::istringstream xs(sizeLine);
+        xs >> std::hex >> chunkSize;
+        if (xs.fail()) return false;
+        pos = lineEnd + 2;
+        if (chunkSize == 0) {
+            size_t trailerEnd = data.find("\r\n", pos);
+            if (trailerEnd == std::string::npos) return false;
+            consumed = trailerEnd + 2;
+            return true;
+        }
+        if (data.size() < pos + chunkSize + 2) return false;
+        out.append(data, pos, chunkSize);
+        pos += chunkSize;
+        if (!(data[pos] == '\r' && data[pos + 1] == '\n')) return false;
+        pos += 2;
+    }
+}
+
+std::string HttpRequest::normalizeChunkedRequest(const std::string& buffer, size_t headerEnd, const std::string& decodedBody) {
+    std::string reqLine = buffer.substr(0, buffer.find("\r\n"));
+    std::string headersOnly = buffer.substr(buffer.find("\r\n") + 2, headerEnd - (buffer.find("\r\n") + 2));
+    std::istringstream hsin(headersOnly);
+    std::string line;
+    std::string rebuiltHeaders;
+    while (std::getline(hsin, line)) {
+        if (!line.empty() && line[line.size() - 1] == '\r') line.erase(line.size() - 1);
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string lower = toLower(line.substr(0, colon));
+        if (lower == "transfer-encoding" || lower == "content-length") continue;
+        rebuiltHeaders += line + "\r\n";
+    }
+    std::ostringstream cl;
+    cl << "Content-Length: " << decodedBody.size() << "\r\n";
+    rebuiltHeaders += cl.str();
+    return reqLine + "\r\n" + rebuiltHeaders + "\r\n" + decodedBody;
+}
+
+bool HttpRequest::wantsKeepAlive() const {
+    std::string connHeader = getHeader("connection");
+    std::string connLower = toLower(connHeader);
+    if (version == "HTTP/1.1") {
+        return (connLower != "close");
+    }
+    return (connLower == "keep-alive");
 }

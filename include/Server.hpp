@@ -151,7 +151,6 @@ private:
     void finalizeCgiRequest(int clientFd, CgiState& cgi, int status, std::string& responseBuffer);
                           
     // Utility
-    std::string getMimeType(const std::string& path) const;
     
     // Config selection
     const ConfigParser::ServerConfig& selectConfig(int port, const std::string& hostHeader) const;

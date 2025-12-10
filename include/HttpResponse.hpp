@@ -2,6 +2,7 @@
 #define HTTPRESPONSE_HPP
 
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -15,7 +16,10 @@ public:
     std::string generateResponse(bool isHead = false);
     int getStatus() const;
     bool hasHeader(const std::string& key) const;
-    std::string getStatusMessage(int statusCode); // Moved from private to public
+    static std::string getStatusMessage(int statusCode);
+    static std::string getMimeType(const std::string& path);
+    void setDefaultErrorBody();
+    void setAllowHeader(const std::set<std::string>& methods);
 
 private:
     int statusCode;
