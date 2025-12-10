@@ -811,6 +811,12 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
         path.find(".cgi") != std::string::npos ||
         !locConfig.getCgiPass().empty();
 
+    // OPTIONS should always return an Allow header with 200
+    if (request.getMethod() == "OPTIONS") {
+        handleOptionsRequest(request, response, config);
+        return;
+    }
+
     // Handle CGI requests
     if (isCgiRequest && (request.getMethod() == "POST" || request.getMethod() == "GET" || request.getMethod() == "HEAD")) {
         std::string cgiEffectiveRoot = !locConfig.getRoot().empty() ? locConfig.getRoot() : config.root;
@@ -852,8 +858,6 @@ void Server::dispatchRequest(int clientFd, HttpRequest& request, HttpResponse& r
         handlePutRequest(request, response, config, locConfig, effectiveRoot);
     } else if (request.getMethod() == "DELETE") {
         handleDeleteRequest(request, response, config, locConfig, effectiveRoot);
-    } else if (request.getMethod() == "OPTIONS") {
-        handleOptionsRequest(request, response, config);
     } else {
         response.setStatus(501); 
         serveErrorPage(response, 501, config);
