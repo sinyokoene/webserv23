@@ -176,7 +176,7 @@ void	findVal(const std::string& configContent, const std::string& keyName, T& ta
 
 Server::Server(const std::string& configContent)
 {
-	static	uint32_t instanceCount;
+	static	uint32_t instanceCount = 0;
 
 	findVal(configContent, "PORT", _port);
 	findVal(configContent, "BODY_SIZE", _bodySize);

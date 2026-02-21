@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <sys/types.h>
 
 #include <sys/epoll.h>
 
@@ -15,9 +16,9 @@
 
 struct	HttpRequest
 {
-	uint16_t	port;
-	uint64_t	contentLength;
-	std::string	requestPath, fileName, contentType, httpMethod, httpProtocol, serverName, requestBody;
+	uint16_t	port = 0;
+	uint64_t	contentLength = 0;
+	std::string	requestPath, queryString, fileName, contentType, httpMethod, httpProtocol, serverName, requestBody;
 };
 
 struct HttpResponse
@@ -37,21 +38,35 @@ struct	ClientSession
 	size_t			sentBytes = 0;
 	bool			responseReady = false;
 	bool			headerParsed = false;
+	bool			chunkedTransfer = false;
 	int64_t			expectedBodySize = -1;
 	size_t			headerEndPos = 0;
 	int64_t			lastActivityAt = 0;
+	bool			cgiActive = false;
+	pid_t			cgiPid = -1;
+	int				cgiInputPipeFd = -1;
+	int				cgiOutputPipeFd = -1;
+	size_t			cgiWriteOffset = 0;
+	std::string		cgiOutputBuffer;
+	int64_t			cgiStartTime = 0;
+
+	ClientSession(VirtualHost& hostRef) : virtualHost(hostRef) {}
 };
 
 class WebServerCore
 {
 	private:
-		int								_epollFd;
+		int								_epollFd = -1;
 		struct epoll_event				_epollEvent, _eventBuffer[10];
 		std::string						_responseData;
 		std::map<int, ClientSession>	_sessionMap;
+		std::map<int, int>				_cgiPipeToClient;
 
 		VirtualHost*	locateVirtualHost(int eventIdx);
 		bool			establishConnection(VirtualHost& virtualHost);
+		void			cleanupSession(int clientFd);
+		void			handleCgiPipeEvent(int pipeFd, uint32_t events);
+		bool			beginCgiForSession(ClientSession& session, int clientFd, HttpResponse& httpResponse);
 		void			processIncomingRequest(std::map<int, ClientSession>::iterator sessionIter);
 		uint16_t		receiveRequestData(ClientSession& session, int clientFd);
 		void			dispatchResponse(std::map<int, ClientSession>::iterator sessionIter);

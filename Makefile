@@ -4,6 +4,7 @@ NAME = webserv
 
 CPPFLAGS = -Wall -Wextra -Werror -std=c++20 -Iinclude #-fsanitize=thread
 LDFLAGS =
+DEBUGFLAGS = -DDEBUG -g -O0
 
 UNAME_S := $(shell uname -s)
 # macOS lacks native epoll; use Homebrew epoll-shim if available.
@@ -47,6 +48,9 @@ fclean: clean
 
 re: fclean all
 
+debug: CPPFLAGS += $(DEBUGFLAGS)
+debug: re
+
 
 .PHONY:
-	all clean fclean re
+	all clean fclean re debug

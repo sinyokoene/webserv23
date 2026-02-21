@@ -31,7 +31,19 @@
 #include "VirtualHost.hpp"
 #include "WebServerCore.hpp"
 
-static constexpr bool	debug = false;
+#ifdef DEBUG
+inline constexpr bool	DEBUG_ENABLED = true;
+#else
+inline constexpr bool	DEBUG_ENABLED = false;
+#endif
+
+namespace defaults
+{
+	inline constexpr int			CONNECTION_TIMEOUT_MS = 5000;
+	inline constexpr int			CGI_TIMEOUT_MS = 10000;
+	inline constexpr uint64_t		MAX_BODY_SIZE = 4096;
+	inline constexpr size_t			MAX_HEADER_SIZE = 8192;
+}
 
 namespace app_paths
 {
@@ -73,8 +85,10 @@ std::string 	getErrorCode(uint16_t code);
 void		handleGet(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
 void		handlePost(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
 void		handleDelete(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
-void		handleCGI(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
 void		getErrorPage(VirtualHost& virtualHost, HttpResponse& httpResponse);
 void		parseRequest(std::string input, VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
+bool		startCGIProcess(VirtualHost& virtualHost, HttpRequest& httpRequest, pid_t& processId, int& inputWriteFd, int& outputReadFd);
+bool		parseCGIResponse(const std::string& cgiOutput, HttpResponse& httpResponse);
+std::string	buildSerializedResponse(const HttpRequest& httpRequest, const HttpResponse& httpResponse);
 
 std::map<std::string, RouteConfig>::iterator	resolveRoute(VirtualHost& virtualHost, std::string fullPath);

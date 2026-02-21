@@ -221,11 +221,12 @@ void	parseNumericValue(const std::string& configBlock, const std::string& keywor
 
 VirtualHost::VirtualHost(const std::string& configBlock)
 {
-	static	uint32_t hostCounter;
+	static	uint32_t hostCounter = 0;
 
 	parseNumericValue(configBlock, "PORT", _listenPort);
 	parseNumericValue(configBlock, "BODY_SIZE", _maxBodySize);
 	parseNumericValue(configBlock, "TIME_OUT", _connectionTimeoutMs);
+	parseNumericValue(configBlock, "CGI_TIME_OUT", _cgiTimeoutMs);
 	_hostName = extractConfigValue(configBlock, "SERVER", true);
 	if (_hostName == "")
 		_hostName = "server" + std::to_string(++hostCounter);
@@ -257,7 +258,8 @@ std::ostream&	operator<<(std::ostream& out, VirtualHost& virtualHost)
 	"\n\tPORT\t\t" << virtualHost._listenPort <<
 	"\n\tBODY_SIZE\t" << virtualHost._maxBodySize <<
 	"\n\tPATH\t\t" << virtualHost._documentRoot << 
-	"\n\tTIME_OUT\t" << virtualHost._connectionTimeoutMs << "ms\n\n";
+	"\n\tTIME_OUT\t" << virtualHost._connectionTimeoutMs << "ms" <<
+	"\n\tCGI_TIME_OUT\t" << virtualHost._cgiTimeoutMs << "ms\n\n";
 
 	for (auto routeEntry : virtualHost._routeTable)
 	{

@@ -59,6 +59,17 @@ WebServerCore::WebServerCore(const std::string& configPath)
 
 WebServerCore::~WebServerCore()
 {
+	for (auto it = _sessionMap.begin(); it != _sessionMap.end(); ++it)
+	{
+		if (it->second.cgiPid > 0)
+			kill(it->second.cgiPid, SIGKILL);
+		if (it->second.cgiInputPipeFd != -1)
+			close(it->second.cgiInputPipeFd);
+		if (it->second.cgiOutputPipeFd != -1)
+			close(it->second.cgiOutputPipeFd);
+		close(it->first);
+	}
+	_sessionMap.clear();
 	for (auto hostIter : _virtualHosts)
 	{
 		if (hostIter->_socketFd != -1)
@@ -74,6 +85,8 @@ WebServerCore::~WebServerCore()
 	{
 		delete hostIter;
 	}
+	if (_epollFd != -1)
+		close(_epollFd);
 	logger::close();
 }
 

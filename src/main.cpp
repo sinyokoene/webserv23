@@ -15,7 +15,7 @@ int	main(int argc, char *argv[])
 			throw VirtualHost::ConfigParseError();
 		}
 		WebServerCore webServerCore(argc == 1 ? app_paths::DEFAULT_CONFIG : argv[1]);
-		if (debug)
+		if (DEBUG_ENABLED)
 		{
 			std::cout << webServerCore;
 		}

@@ -1,15 +1,27 @@
 #include "webserv.hpp"
 
+namespace
+{
 void	free2D(const char* const* envArray)
 {
-	for (uint32_t i = 0; envArray && envArray[i] != nullptr; i++)
+	for (uint32_t i = 0; envArray != nullptr && envArray[i] != nullptr; i++)
 	{
 		delete[] envArray[i];
 	}
 	delete[] envArray;
 }
 
-const char**	initEnv(const HttpRequest& httpRequest)
+std::string	extractScriptDir(const std::string& scriptPath)
+{
+	const size_t slashPos = scriptPath.find_last_of('/');
+	if (slashPos == std::string::npos)
+		return ".";
+	if (slashPos == 0)
+		return "/";
+	return scriptPath.substr(0, slashPos);
+}
+
+const char**	initEnv(const HttpRequest& httpRequest, const std::string& scriptPath)
 {
 	std::vector<std::string> envVars = 
 	{
@@ -21,9 +33,10 @@ const char**	initEnv(const HttpRequest& httpRequest)
 		"SERVER_NAME=" + httpRequest.serverName,
 		"SERVER_PORT=" + std::to_string(httpRequest.port),
 		"CONTENT_TYPE=" + httpRequest.contentType,
-		"CONTENT_LENGTH=" + std::to_string(httpRequest.contentLength),
+		"CONTENT_LENGTH=" + std::to_string(httpRequest.requestBody.length()),
+		"QUERY_STRING=" + httpRequest.queryString,
 		"SCRIPT_NAME=" + httpRequest.requestPath,
-		"SCRIPT_FILENAME=" + httpRequest.requestPath,
+		"SCRIPT_FILENAME=" + scriptPath,
 		"PATH_INFO=" + httpRequest.requestPath,
 		"TZ=Europe/Amsterdam"
 	};
@@ -48,7 +61,7 @@ const char**	initEnv(const HttpRequest& httpRequest)
 	return (const char**)envArray;
 }
 
-bool	initFork(int inputPipe[2], int outputPipe[2], pid_t& processId)
+bool	createPipesAndFork(int inputPipe[2], int outputPipe[2], pid_t& processId)
 {
 	if (pipe(inputPipe) < 0)
 	{
@@ -75,19 +88,23 @@ bool	initFork(int inputPipe[2], int outputPipe[2], pid_t& processId)
 	return true;
 }
 
-void	execute(VirtualHost& virtualHost, HttpRequest& httpRequest, int inputPipe[2], int outputPipe[2])
+void	executeChildProcess(VirtualHost& virtualHost, HttpRequest& httpRequest, int inputPipe[2], int outputPipe[2])
 {
 	close(inputPipe[1]);
 	close(outputPipe[0]);
 
-	std::string		scriptPath    = virtualHost._documentRoot + httpRequest.requestPath;
-	const char**	envVars     = initEnv(httpRequest);
+	const std::string scriptPath = std::filesystem::absolute(
+		virtualHost._documentRoot + httpRequest.requestPath).string();
+	const std::string	scriptDir  = extractScriptDir(scriptPath);
+	const char**	envVars     = initEnv(httpRequest, scriptPath);
 	const char*		argv[2] = {scriptPath.c_str(), nullptr};
 
 	if (envVars == nullptr)
 	{
 		exit(EXIT_FAILURE);
 	}
+	if (chdir(scriptDir.c_str()) < 0)
+		exit(EXIT_FAILURE);
 	if (dup2(inputPipe[0], STDIN_FILENO) < 0 || dup2(outputPipe[1], STDOUT_FILENO) < 0)
 	{
 		exit(EXIT_FAILURE);
@@ -96,102 +113,89 @@ void	execute(VirtualHost& virtualHost, HttpRequest& httpRequest, int inputPipe[2
 	free2D(envVars);
 	exit(EXIT_FAILURE);
 }
+} // namespace
 
-void	handleCGI(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse)
+bool	startCGIProcess(VirtualHost& virtualHost, HttpRequest& httpRequest, pid_t& processId, int& inputWriteFd, int& outputReadFd)
 {
 	int		inputPipe[2], outputPipe[2];
-	pid_t	processId;
 	
 	if (isDirectory(virtualHost._documentRoot + httpRequest.requestPath))
 	{
-		httpResponse.statusCode = 403;
-		return;
+		return false;
 	}
-	if (initFork(inputPipe, outputPipe, processId) == false)
+	if (createPipesAndFork(inputPipe, outputPipe, processId) == false)
 	{
-		httpResponse.statusCode = 500;
-		return;
+		return false;
 	}
 	if (!processId)
 	{
-		execute(virtualHost, httpRequest, inputPipe, outputPipe);
+		executeChildProcess(virtualHost, httpRequest, inputPipe, outputPipe);
 	}
-
 	close(inputPipe[0]);
 	close(outputPipe[1]);
-	if (httpRequest.contentLength > 0)
+	inputWriteFd = inputPipe[1];
+	outputReadFd = outputPipe[0];
+	return true;
+}
+
+bool	parseCGIResponse(const std::string& cgiOutput, HttpResponse& httpResponse)
+{
+	const std::string separator = "\r\n\r\n";
+	const size_t headerEnd = cgiOutput.find(separator);
+	if (headerEnd == std::string::npos)
 	{
-		ssize_t	totalWritten = 0;
-		while (totalWritten < static_cast<ssize_t>(httpRequest.contentLength))
-		{
-		ssize_t bytes = write(inputPipe[1], httpRequest.requestBody.c_str() + totalWritten,
-			httpRequest.contentLength - totalWritten);
-		if (bytes < 0)
-		{
-			close(inputPipe[1]);
-				close(outputPipe[0]);
-				httpResponse.statusCode = 500;
-				logger::addMsg("couldn't write to pipe");
-				return;
-			}
-			if (bytes == 0)
-				break;
-			totalWritten += bytes;
-		}
-		if (totalWritten < static_cast<ssize_t>(httpRequest.contentLength))
-		{
-			close(inputPipe[1]);
-			close(outputPipe[0]);
-			httpResponse.statusCode = 500;
-			logger::addMsg("short write to CGI input pipe");
-			return;
-		}
+		httpResponse.responseBody = cgiOutput;
+		httpResponse.contentLength = httpResponse.responseBody.length();
+		httpResponse.mimeType = ".html";
+		return true;
 	}
 
-	// check child
-	close(inputPipe[1]);
-	int	exitStatus;
-	checkTimeoutExpired(virtualHost._connectionTimeoutMs);
-	while (waitpid(processId, &exitStatus, WNOHANG) == 0)
-	{
-		if(checkTimeoutExpired() == true)
-		{
-			kill(processId, SIGKILL);
-			httpResponse.statusCode = 500;
-			logger::addMsg("script timed out");
-			close(outputPipe[0]);
-			return;
-		}
-	}
-	if (WEXITSTATUS(exitStatus) != 0)
-	{
-		httpResponse.statusCode = 500;
-		logger::addMsg("failed to run script, exit status: " + std::to_string(WEXITSTATUS(exitStatus)));
-		close(outputPipe[0]);
-		return;
-	}
-
-	// The child process has already exited (confirmed by waitpid above).
-	// All output is already present in the kernel pipe buffer — reads will
-	// not block. This pipe fd is local IPC, not a network socket.
-	char		buffer[1025]{};
-	ssize_t		bytesRead;
-	std::string	outputContent;
-	do
-	{
-		bytesRead = read(outputPipe[0], buffer, sizeof(buffer) - 1);
-		if (bytesRead > 0)
-			outputContent.append(buffer, bytesRead);
-		std::memset(buffer, '\0', sizeof(buffer));
-	}
-	while(bytesRead > 0);
-	close(outputPipe[0]);
-	if (bytesRead < 0)
-	{
-		httpResponse.statusCode = 500;
-		logger::addMsg("failed to read script output");
-		return;
-	}
-	layoutPage(httpResponse, httpRequest.requestPath, outputContent);
+	const std::string headers = cgiOutput.substr(0, headerEnd);
+	httpResponse.responseBody = cgiOutput.substr(headerEnd + separator.length());
 	httpResponse.contentLength = httpResponse.responseBody.length();
+	httpResponse.extraHeaders.clear();
+
+	std::istringstream headerStream(headers);
+	std::string line;
+	while (std::getline(headerStream, line))
+	{
+		if (line.empty())
+			continue;
+		if (line.back() == '\r')
+			line.erase(line.length() - 1);
+		if (line.find("Status:") == 0)
+		{
+			std::string codePart = extractSubstring(line, "Status:", " ", strlen("Status: "));
+			if (codePart.empty() == false)
+			{
+				try
+				{
+					httpResponse.statusCode = static_cast<uint16_t>(std::stoi(codePart));
+				}
+				catch (const std::exception&)
+				{
+					httpResponse.statusCode = 500;
+					return false;
+				}
+			}
+			continue;
+		}
+		if (line.find("Content-Type:") == 0)
+		{
+			std::string typeValue = line.substr(strlen("Content-Type:"));
+			while (typeValue.empty() == false && (typeValue[0] == ' ' || typeValue[0] == '\t'))
+				typeValue.erase(0, 1);
+			if (typeValue.find("text/html") != std::string::npos)
+				httpResponse.mimeType = ".html";
+			else if (typeValue.find("application/json") != std::string::npos)
+				httpResponse.mimeType = ".json";
+			else if (typeValue.find("text/plain") != std::string::npos)
+				httpResponse.mimeType = ".txt";
+			continue;
+		}
+		httpResponse.extraHeaders += line + "\r\n";
+	}
+	if (httpResponse.mimeType.empty())
+		httpResponse.mimeType = ".html";
+	return true;
 }

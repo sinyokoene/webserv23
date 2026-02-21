@@ -22,16 +22,20 @@ struct RouteConfig
 class VirtualHost
 {
 	public:
+		static constexpr int				DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
+		static constexpr int				DEFAULT_CGI_TIMEOUT_MS = 10000;
+		static constexpr uint64_t			DEFAULT_MAX_BODY_SIZE = 4096;
 		// from config file
-		int									_connectionTimeoutMs = 5000;
+		int									_connectionTimeoutMs = DEFAULT_CONNECTION_TIMEOUT_MS;
+		int									_cgiTimeoutMs = DEFAULT_CGI_TIMEOUT_MS;
 		uint16_t							_listenPort = 8080;
-		uint64_t							_maxBodySize = 4096;
+		uint64_t							_maxBodySize = DEFAULT_MAX_BODY_SIZE;
 		std::string							_hostName, _bindAddress, _documentRoot;
 		std::map<uint16_t, std::string>		_errorPageMap;
 		std::map<std::string, RouteConfig>	_routeTable;
 
 		// for sockets
-		int						_socketFd, _socketOpt, _epollFd;
+		int						_socketFd = -1, _socketOpt = -1, _epollFd = -1;
 
 		VirtualHost(const std::string& configBlock);
 		~VirtualHost();

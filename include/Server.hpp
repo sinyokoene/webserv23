@@ -20,15 +20,17 @@ struct t_location
 class Server
 {
 	public:
+		static constexpr uint64_t			DEFAULT_BODY_SIZE = 4096;
+		static constexpr uint64_t			DEFAULT_TIMEOUT_MS = 5000;
 		// from config file
 		uint16_t							_port = 8080;
-		uint64_t							_bodySize = 4096, _timeOut = 5000;
+		uint64_t							_bodySize = DEFAULT_BODY_SIZE, _timeOut = DEFAULT_TIMEOUT_MS;
 		std::string							_name, _host, _path;
 		std::map<uint16_t, std::string>		_errorTable;
 		std::map<std::string, t_location>	_locations;
 
 		// for sockets
-		int						_serverFD, _opt, _epfd;
+		int						_serverFD = -1, _opt = -1, _epfd = -1;
 
 		Server(const std::string& config);
 		~Server();
