@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Upload file</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <div class="header-content">
+            <h1>WebServ</h1>
+            <nav>
+                <a href="/index.html">Home</a>
+                <a href="/upload.html" class="active">Upload</a>
+                <a href="/test.html">Form Test</a>
+                <a href="/cgi-bin/time.py">CGI (Python)</a>
+                <a href="/cgi-bin/time.php">CGI (PHP)</a>
+                <a href="/cgi-bin/infinite.py">CGI (Infinite loop)</a>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>Upload a File</h2>
+            <p class="text-muted">Sends a POST with multipart/form-data to /www.</p>
+            <form action="/www" method="POST" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="file">Choose a file to upload</label>
+                    <input type="file" id="file" name="file" required>
+                </div>
+                <button type="submit" class="btn">Upload File</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Dashboard | WebServ</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<header>
+		<nav>
+			<ul>
+				<li><a href="dashboard.html" class="active"><h1>Dashboard</h1></a></li>
+				<li><a href="gallery.html"><h1>Gallery</h1></a></li>
+				<li><a href="cgiDemo.html"><h1>CGI Demo</h1></a></li>
+				<li><a href="fileUpload.html"><h1>File Upload</h1></a></li>
+			</ul>
+		</nav>
+	</header>
+	<main class="dashboard">
+		<div class="card">
+			<h1>Welcome to WebServ</h1>
+			<p>A lightweight HTTP/1.1 compliant web server built from scratch in C++. This project demonstrates core networking concepts including socket programming, multiplexing with epoll, and HTTP protocol handling.</p>
+		</div>
+		<div class="card">
+			<h1>Server Features</h1>
+			<p>WebServ supports GET, POST, and DELETE methods, CGI script execution, file uploads, custom error pages, and multiple virtual host configurations. The server efficiently handles concurrent connections using the epoll event-driven architecture.</p>
+		</div>
+		<div class="card">
+			<h1>Getting Started</h1>
+			<p>Navigate through the tabs above to explore different features. Try the CGI Demo to execute server-side scripts, or upload files through the File Upload page. The Gallery showcases static content serving capabilities.</p>
+		</div>
+	</main>
+</body>
+</html>
+

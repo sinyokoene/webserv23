@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Test CGI</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header>
+        <div class="header-content">
+            <h1>WebServ</h1>
+            <nav>
+                <a href="/index.html">Home</a>
+                <a href="/upload.html">Upload</a>
+                <a href="/test.html" class="active">Form Test</a>
+                <a href="/cgi-bin/time.py">CGI (Python)</a>
+                <a href="/cgi-bin/time.php">CGI (PHP)</a>
+                <a href="/cgi-bin/infinite.py">CGI (Infinite loop)</a>
+            </nav>
+        </div>
+    </header>
+
+    <main>
+        <section class="card">
+            <h2>Post Form</h2>
+            <p class="text-muted">Submit data to /cgi-bin/process.py to verify POST handling.</p>
+            <form action="/cgi-bin/process.py" method="post">
+                <div class="form-group">
+                    <label for="name">Name</label>
+                    <input type="text" id="name" name="name" required>
+                </div>
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input type="email" id="email" name="email" required>
+                </div>
+                <div class="form-group">
+                    <label for="message">Message</label>
+                    <textarea id="message" name="message" rows="3" required></textarea>
+                </div>
+                <button type="submit" class="btn">Submit</button>
+            </form>
+        </section>
+
+        <section class="card">
+            <h2>CGI Demos</h2>
+            <div class="nav-links">
+                <a href="/cgi-bin/time.py">CGI Demo (Python)</a>
+                <a href="/cgi-bin/time.php">CGI Demo (PHP)</a>
+                <a href="/cgi-bin/infinite.py">CGI Demo (Infinite)</a>
+            </div>
+        </section>
+    </main>
+</body>
+</html>

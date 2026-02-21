@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>File Upload | WebServ</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<header>
+		<nav>
+			<ul>
+				<li><a href="dashboard.html"><h1>Dashboard</h1></a></li>
+				<li><a href="gallery.html"><h1>Gallery</h1></a></li>
+				<li><a href="cgiDemo.html"><h1>CGI Demo</h1></a></li>
+				<li><a href="fileUpload.html" class="active"><h1>File Upload</h1></a></li>
+			</ul>
+		</nav>
+	</header>
+	<main class="dashboard">
+		<div class="card">
+			<h1>Upload Files</h1>
+			<p class="text-muted mt-1">Upload files to the server using HTTP POST</p>
+			<form action="/www" method="POST" enctype="multipart/form-data" class="mt-3">
+				<div>
+					<label for="file">Select File</label>
+					<input type="file" id="file" name="file" required>
+				</div>
+				<button type="submit">Upload File</button>
+			</form>
+		</div>
+	</main>
+</body>
+</html>
+
