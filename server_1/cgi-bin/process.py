@@ -1,44 +1,105 @@
 #!/usr/bin/env python3
 
 import sys
+import os
+import json
 import urllib.parse
+import html
 from pathlib import Path
+from datetime import datetime
 
-def emit_headers():
-    # Minimal headers for CGI response
-    sys.stdout.write("Content-Type: text/html\r\n\r\n")
+def emit_headers(content_type="text/html", extra_headers=None):
+  sys.stdout.write(f"Content-Type: {content_type}\r\n")
+  if extra_headers:
+    for key, value in extra_headers.items():
+      sys.stdout.write(f"{key}: {value}\r\n")
+  sys.stdout.write("\r\n")
+
+
+def submissions_path():
+  return Path(__file__).resolve().parent / "server_1" / "forms" / "submissions.txt"
+
+
+def load_posts(submissions):
+  if not submissions.exists():
+    return []
+
+  posts = []
+  current = {}
+  collecting_message = False
+
+  with submissions.open("r") as f:
+    for raw_line in f:
+      line = raw_line.rstrip("\n")
+
+      if line.startswith("Time: "):
+        current["time"] = line[6:]
+        collecting_message = False
+      elif line.startswith("Name: "):
+        current["name"] = line[6:]
+        collecting_message = False
+      elif line.startswith("Email: "):
+        current["email"] = line[7:]
+        collecting_message = False
+      elif line.startswith("Message: "):
+        current["message"] = line[9:]
+        collecting_message = True
+      elif line.strip() == "---":
+        posts.append({
+          "time": current.get("time", ""),
+          "name": current.get("name", ""),
+          "email": current.get("email", ""),
+          "message": current.get("message", "")
+        })
+        current = {}
+        collecting_message = False
+      elif collecting_message:
+        current["message"] = current.get("message", "") + "\n" + line
+
+  if current:
+    posts.append({
+      "time": current.get("time", ""),
+      "name": current.get("name", ""),
+      "email": current.get("email", ""),
+      "message": current.get("message", "")
+    })
+
+  return posts
 
 def main():
+    method = os.environ.get("REQUEST_METHOD", "GET").upper()
+    submissions = submissions_path()
+
+    if method == "GET":
+        query = urllib.parse.parse_qs(os.environ.get("QUERY_STRING", ""))
+        if "posts" in query:
+            emit_headers("application/json")
+            print(json.dumps({"posts": load_posts(submissions)}))
+            return
+
+        emit_headers()
+        print("<h1>Method Not Allowed</h1><p>Use POST to submit or GET with ?posts=1 to list posts.</p>")
+        return
+
     raw_input = sys.stdin.read()
     form_data = urllib.parse.parse_qs(raw_input)
     name = form_data.get('name', [''])[0]
     email = form_data.get('email', [''])[0]
     message = form_data.get('message', [''])[0]
+    timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    submissions = Path("server_1/forms/submissions.txt")
     submissions.parent.mkdir(parents=True, exist_ok=True)
     with submissions.open("a") as f:
-        f.write(f"Name: {name}\nEmail: {email}\nMessage: {message}\n---\n\n")
+        f.write(
+            f"Time: {timestamp}\n"
+            f"Name: {name}\n"
+            f"Email: {email}\n"
+            f"Message: {message}\n"
+            "---\n\n"
+        )
 
-    emit_headers()
-    print("""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="/style.css">
-  <title>Form submitted</title>
-</head>
-<body>
-  <main style="display:flex;justify-content:center;align-items:center;min-height:100vh;">
-    <section class="card" style="max-width:520px;text-align:center;">
-      <h2>Form Submitted Successfully</h2>
-      <p class="mb-4">Thank you, """ + (name or "friend") + """!</p>
-      <a class="btn" href="/index.html">Back to home</a>
-    </section>
-  </main>
-</body>
-</html>""")
+    emit_headers("application/json")
+    print(json.dumps({"ok": True, "message": "success! :)"}))
 
 if __name__ == "__main__":
     try:
@@ -46,4 +107,4 @@ if __name__ == "__main__":
     except Exception as e:
         emit_headers()
         print("<h1>Form Submission Failed</h1>")
-        print(f"<pre>{e}</pre>")
+        print(f"<pre>{html.escape(str(e))}</pre>")

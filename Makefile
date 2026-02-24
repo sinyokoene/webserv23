@@ -22,11 +22,9 @@ OBJ_DIR =	obj
 
 OBJ =		$(SRC:%.cpp=$(OBJ_DIR)/%.o)
 
-DEPS =		$(OBJ:.o=.d)
-
 $(OBJ_DIR)/%.o: %.cpp
 	@mkdir -p $(@D)
-	c++ $(CPPFLAGS) -MMD -c $< -o $@
+	c++ $(CPPFLAGS) -c $< -o $@
 
 
 $(NAME) :	$(OBJ)
@@ -36,10 +34,8 @@ $(NAME) :	$(OBJ)
 
 all :		$(NAME)
 
--include $(DEPS)
-
 clean:
-	rm -f $(OBJ) $(DEPS)
+	rm -f $(OBJ)
 	rm -rf $(OBJ_DIR)
 
 fclean: clean

@@ -139,3 +139,54 @@ void	parseRequest(std::string input, VirtualHost& virtualHost, HttpRequest& http
 	if (httpRequest.requestBody.empty() == false)
 		httpRequest.contentLength = httpRequest.requestBody.length();
 }
+
+bool	parseChunkedBody(const std::string& rawRequest, size_t bodyStart, std::string& decodedBody, size_t& consumedBytes, bool& malformedBody)
+{
+	size_t cursor = bodyStart;
+	decodedBody.clear();
+	consumedBytes = 0;
+	malformedBody = false;
+	while (true)
+	{
+		const size_t lineEnd = rawRequest.find("\r\n", cursor);
+		if (lineEnd == std::string::npos)
+			return false;
+		std::string sizeLine = rawRequest.substr(cursor, lineEnd - cursor);
+		const size_t extPos = sizeLine.find(';');
+		if (extPos != std::string::npos)
+			sizeLine = sizeLine.substr(0, extPos);
+		size_t chunkSize = 0;
+		try
+		{
+			chunkSize = std::stoul(sizeLine, nullptr, 16);
+		}
+		catch (const std::exception&)
+		{
+			malformedBody = true;
+			return false;
+		}
+		cursor = lineEnd + 2;
+		if (chunkSize == 0)
+		{
+			if (rawRequest.length() < cursor + 2)
+				return false;
+			if (rawRequest.compare(cursor, 2, "\r\n") != 0)
+			{
+				malformedBody = true;
+				return false;
+			}
+			consumedBytes = cursor + 2 - bodyStart;
+			return true;
+		}
+		if (rawRequest.length() < cursor + chunkSize + 2)
+			return false;
+		decodedBody.append(rawRequest, cursor, chunkSize);
+		cursor += chunkSize;
+		if (rawRequest.compare(cursor, 2, "\r\n") != 0)
+		{
+			malformedBody = true;
+			return false;
+		}
+		cursor += 2;
+	}
+}

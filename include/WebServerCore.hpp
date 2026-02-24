@@ -65,6 +65,7 @@ class WebServerCore
 		VirtualHost*	locateVirtualHost(int eventIdx);
 		bool			establishConnection(VirtualHost& virtualHost);
 		void			cleanupSession(int clientFd);
+		void			closeCgiPipe(int& pipeFd);
 		void			handleCgiPipeEvent(int pipeFd, uint32_t events);
 		bool			beginCgiForSession(ClientSession& session, int clientFd, HttpResponse& httpResponse);
 		void			processIncomingRequest(std::map<int, ClientSession>::iterator sessionIter);

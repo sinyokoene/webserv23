@@ -87,6 +87,7 @@ void		handlePost(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpRespons
 void		handleDelete(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
 void		getErrorPage(VirtualHost& virtualHost, HttpResponse& httpResponse);
 void		parseRequest(std::string input, VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse);
+bool		parseChunkedBody(const std::string& rawRequest, size_t bodyStart, std::string& decodedBody, size_t& consumedBytes, bool& malformedBody);
 bool		startCGIProcess(VirtualHost& virtualHost, HttpRequest& httpRequest, pid_t& processId, int& inputWriteFd, int& outputReadFd);
 bool		parseCGIResponse(const std::string& cgiOutput, HttpResponse& httpResponse);
 std::string	buildSerializedResponse(const HttpRequest& httpRequest, const HttpResponse& httpResponse);

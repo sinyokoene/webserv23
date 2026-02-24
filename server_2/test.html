@@ -27,7 +27,7 @@
         <section class="card">
             <h2>Post Form</h2>
             <p class="text-muted">Submit data to /cgi-bin/process.py to verify POST handling.</p>
-            <form action="/cgi-bin/process.py" method="post">
+            <form id="post-form" action="/cgi-bin/process.py" method="post">
                 <div class="form-group">
                     <label for="name">Name</label>
                     <input type="text" id="name" name="name" required>
@@ -52,6 +52,118 @@
                 <a href="/cgi-bin/infinite.py">CGI Demo (Infinite)</a>
             </div>
         </section>
+
+        <section class="card">
+            <h2>Submitted Posts</h2>
+            <p class="text-muted" id="posts-status">Loading posts...</p>
+            <div id="posts-list"></div>
+        </section>
     </main>
+
+    <script>
+        function formatTimestamp(raw) {
+            if (!raw) return "Unknown time";
+            const date = new Date(raw);
+            if (Number.isNaN(date.getTime())) return raw;
+            return date.toLocaleString();
+        }
+
+        function createPostElement(post) {
+            const card = document.createElement("div");
+            card.style.border = "1px solid #ddd";
+            card.style.borderRadius = "8px";
+            card.style.padding = "0.75rem";
+            card.style.marginBottom = "0.75rem";
+            card.style.background = "#fafafa";
+
+            const name = document.createElement("p");
+            name.innerHTML = "<strong>Name:</strong> ";
+            name.append(document.createTextNode(post.name || "-"));
+
+            const email = document.createElement("p");
+            email.innerHTML = "<strong>Email:</strong> ";
+            email.append(document.createTextNode(post.email || "-"));
+
+            const time = document.createElement("p");
+            time.innerHTML = "<strong>Posted:</strong> ";
+            time.append(document.createTextNode(formatTimestamp(post.time)));
+
+            const message = document.createElement("p");
+            message.innerHTML = "<strong>Message:</strong>";
+            const messageBody = document.createElement("div");
+            messageBody.style.whiteSpace = "pre-wrap";
+            messageBody.style.marginTop = "0.35rem";
+            messageBody.textContent = post.message || "-";
+
+            card.appendChild(name);
+            card.appendChild(email);
+            card.appendChild(time);
+            card.appendChild(message);
+            card.appendChild(messageBody);
+            return card;
+        }
+
+        async function loadPosts() {
+            const status = document.getElementById("posts-status");
+            const list = document.getElementById("posts-list");
+
+            try {
+                const response = await fetch("/cgi-bin/process.py?posts=1", { cache: "no-store" });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                const posts = Array.isArray(data.posts) ? data.posts : [];
+
+                list.innerHTML = "";
+                if (posts.length === 0) {
+                    status.textContent = "No posts yet.";
+                    return;
+                }
+
+                status.textContent = `${posts.length} post${posts.length > 1 ? "s" : ""} loaded.`;
+                posts.forEach((post) => {
+                    list.appendChild(createPostElement(post));
+                });
+            } catch (error) {
+                status.textContent = `Failed to load posts: ${error.message}`;
+            }
+        }
+
+        async function submitPost(event) {
+            event.preventDefault();
+
+            const form = event.currentTarget;
+            const formData = new FormData(form);
+            const body = new URLSearchParams(formData);
+
+            try {
+                const response = await fetch(form.action, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: body.toString()
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                if (!data.ok) {
+                    throw new Error(data.message || "submit failed");
+                }
+
+                alert("success! :)");
+                form.reset();
+                await loadPosts();
+            } catch (error) {
+                alert(`submit failed: ${error.message}`);
+            }
+        }
+
+        document.getElementById("post-form").addEventListener("submit", submitPost);
+        loadPosts();
+    </script>
 </body>
 </html>

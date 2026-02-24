@@ -26,6 +26,7 @@ void	layoutPage(HttpResponse& httpResponse, std::string title, std::string text)
 	}
 
 	httpResponse.contentLength = httpResponse.responseBody.length();
+	httpResponse.mimeType = ".html";
 }
 
 void	getErrorPage(VirtualHost& virtualHost, HttpResponse& httpResponse)
@@ -52,6 +53,7 @@ void	getErrorPage(VirtualHost& virtualHost, HttpResponse& httpResponse)
 	buffer << infile.rdbuf();
 	httpResponse.responseBody = buffer.str();
 	httpResponse.contentLength = httpResponse.responseBody.length();
+	httpResponse.mimeType = ".html";
 }
 
 void	autoIndex(VirtualHost& virtualHost, HttpRequest& httpRequest, HttpResponse& httpResponse)

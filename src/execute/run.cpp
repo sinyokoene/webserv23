@@ -89,20 +89,8 @@ void	WebServerCore::startEventLoop()
 					session.responseBuffer = buildSerializedResponse(session.httpRequest, session.httpResponse);
 					session.responseReady = true;
 					session.cgiActive = false;
-					if (session.cgiInputPipeFd != -1)
-					{
-						epoll_ctl(_epollFd, EPOLL_CTL_DEL, session.cgiInputPipeFd, nullptr);
-						close(session.cgiInputPipeFd);
-						_cgiPipeToClient.erase(session.cgiInputPipeFd);
-						session.cgiInputPipeFd = -1;
-					}
-					if (session.cgiOutputPipeFd != -1)
-					{
-						epoll_ctl(_epollFd, EPOLL_CTL_DEL, session.cgiOutputPipeFd, nullptr);
-						close(session.cgiOutputPipeFd);
-						_cgiPipeToClient.erase(session.cgiOutputPipeFd);
-						session.cgiOutputPipeFd = -1;
-					}
+					closeCgiPipe(session.cgiInputPipeFd);
+					closeCgiPipe(session.cgiOutputPipeFd);
 				}
 				else
 				{

@@ -27,7 +27,7 @@
         <section class="card">
             <h2>Upload a File</h2>
             <p class="text-muted">Sends a POST with multipart/form-data to /www.</p>
-            <form action="/www" method="POST" enctype="multipart/form-data">
+            <form id="upload-form" action="/www" method="POST" enctype="multipart/form-data">
                 <div class="form-group">
                     <label for="file">Choose a file to upload</label>
                     <input type="file" id="file" name="file" required>
@@ -35,6 +35,83 @@
                 <button type="submit" class="btn">Upload File</button>
             </form>
         </section>
+
+        <section class="card">
+            <h2>Uploaded Files</h2>
+            <p class="text-muted" id="uploads-status">Loading uploads...</p>
+            <ul id="uploads-list" class="file-list"></ul>
+        </section>
     </main>
+
+    <script>
+        function fileNameFromHref(href) {
+            const parts = href.split("/");
+            return decodeURIComponent(parts[parts.length - 1] || "uploaded file");
+        }
+
+        function renderUploadItem(href) {
+            const item = document.createElement("li");
+            const link = document.createElement("a");
+            link.href = href;
+            link.textContent = fileNameFromHref(href);
+            item.appendChild(link);
+            return item;
+        }
+
+        async function loadUploads() {
+            const status = document.getElementById("uploads-status");
+            const list = document.getElementById("uploads-list");
+
+            try {
+                const response = await fetch("/www", { cache: "no-store" });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const htmlText = await response.text();
+                const doc = new DOMParser().parseFromString(htmlText, "text/html");
+                const links = Array.from(doc.querySelectorAll('a[href^="/www/"]'));
+                const hrefs = [...new Set(links.map((link) => link.getAttribute("href") || "").filter(Boolean))];
+
+                list.innerHTML = "";
+                if (hrefs.length === 0) {
+                    status.textContent = "No uploads yet.";
+                    return;
+                }
+
+                status.textContent = `${hrefs.length} upload${hrefs.length > 1 ? "s" : ""} found.`;
+                hrefs.forEach((href) => list.appendChild(renderUploadItem(href)));
+            } catch (error) {
+                status.textContent = `Failed to load uploads: ${error.message}`;
+            }
+        }
+
+        async function submitUpload(event) {
+            event.preventDefault();
+
+            const form = event.currentTarget;
+            const formData = new FormData(form);
+
+            try {
+                const response = await fetch(form.action, {
+                    method: "POST",
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                alert("Upload successful!");
+                form.reset();
+                await loadUploads();
+            } catch (error) {
+                alert(`Upload failed: ${error.message}`);
+            }
+        }
+
+        document.getElementById("upload-form").addEventListener("submit", submitUpload);
+        loadUploads();
+    </script>
 </body>
 </html>
