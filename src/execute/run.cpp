@@ -54,7 +54,7 @@ void	WebServerCore::startEventLoop()
 					continue;
 				const uint32_t events = _eventBuffer[i].events;
 
-				if (events & (EPOLLERR | EPOLLHUP))
+				if (events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP))
 				{
 					cleanupSession(it->first);
 					continue;

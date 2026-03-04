@@ -20,7 +20,7 @@ bool	WebServerCore::establishConnection(VirtualHost &virtualHost)
 	}
 	setFdFlag(clientFd, O_NONBLOCK);
 
-	_epollEvent.events = EPOLLIN | EPOLLOUT;
+	_epollEvent.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
 	_epollEvent.data.fd = clientFd;
 	if (epoll_ctl(_epollFd, EPOLL_CTL_ADD, clientFd, &_epollEvent) == -1)
 	{
