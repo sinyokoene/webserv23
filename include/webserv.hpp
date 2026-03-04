@@ -67,7 +67,6 @@ namespace logger
 
 // time
 int64_t		getMilliseconds();
-bool		checkTimeoutExpired(int64_t durationMs = 0);
 
 // tools
 void			setFdFlag(int fd, int flag);

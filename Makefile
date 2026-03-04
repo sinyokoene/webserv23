@@ -29,7 +29,7 @@ $(OBJ_DIR)/%.o: %.cpp
 
 $(NAME) :	$(OBJ)
 	@echo "$(BLUE)Building $(NAME)...$(RESET)"
-	c++ $(CPPFLAGS) $(OBJ) $(LIBFT) $(LDFLAGS) -o $(NAME)
+	c++ $(CPPFLAGS) $(OBJ) $(LDFLAGS) -o $(NAME)
 	@echo "$(GREEN)$(NAME) built$(RESET)"
 
 all :		$(NAME)

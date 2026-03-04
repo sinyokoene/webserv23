@@ -72,21 +72,6 @@ int64_t	getMilliseconds()
 	return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// Set by calling with `durationMs` set to the desired duration
-// Will otherwise return true when time has passed
-bool	checkTimeoutExpired(int64_t durationMs)
-{
-	static int64_t targetTimeMs;
-	int64_t currentTimeMs = getMilliseconds();
-
-	if (durationMs != 0)
-	{
-		targetTimeMs = currentTimeMs + durationMs;
-		return false;
-	}
-	return targetTimeMs <= currentTimeMs;
-}
-
 std::string	extractConfigValue(const std::string& configText, const std::string& keyName, bool throwOnMissing)
 {
 	uint64_t startPos = configText.find(keyName);

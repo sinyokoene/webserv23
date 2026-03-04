@@ -40,20 +40,18 @@ The binary is compiled as `webserv` with `-std=c++20 -Wall -Wextra -Werror`.
 │   └── default.conf
 ├── include/                 # header files
 │   ├── webserv.hpp          # central header, constants, logger, function declarations
-│   ├── WebServerCore.hpp    # epoll event loop
-│   ├── ServerManager.hpp    # manages multiple Server instances
-│   ├── Server.hpp           # single listening socket
-│   └── VirtualHost.hpp      # per-host config, request/response structs
+│   ├── WebServerCore.hpp    # epoll event loop and session lifecycle
+│   └── VirtualHost.hpp      # per-host config and socket initialization
 ├── src/
 │   ├── main.cpp
-│   ├── classes/             # Server, ServerManager, VirtualHost, WebServerCore
+│   ├── classes/             # VirtualHost, WebServerCore
 │   ├── execute/             # request handlers: get, post, delete, cgi, run
 │   ├── parse/               # HTTP request parser
 │   └── tools/               # logging, MIME lookup, string utilities
 ├── server_1/                # document root for webserv-alpha (port 8080)
 │   ├── cgi-bin/             # CGI scripts (Python, PHP)
 │   ├── errorPages/          # custom error pages
-│   └── pages/               # extra static pages
+│   └── www/                 # uploaded/static assets served by /www
 ├── server_2/                # document root for webserv-beta  (port 9090)
 ├── layoutPage.html          # HTML template used for generated pages
 ├── test_webserver.py        # integration test suite
@@ -89,12 +87,6 @@ SERVER  webserv-alpha
         TEMP_FILE   uploadedFile
     ]
 
-    LOCATION    /pages
-    [
-        AUTO_INDEX  true
-        PERMISSIONS get
-    ]
-
     LOCATION    /cgi-bin
     [
         PERMISSIONS get
@@ -108,7 +100,7 @@ SERVER  webserv-alpha
     LOCATION    /redirect
     [
         PERMISSIONS get
-        REDIRECT    302 /dashboard.html
+        REDIRECT    302 /index.html
     ]
 
     LOCATION    /errorPages
@@ -137,7 +129,8 @@ SERVER  webserv-alpha
 | `PORT` | server | Listening port |
 | `PATH` | server | Document root directory |
 | `BODY_SIZE` | server | Maximum request body size in bytes |
-| `TIME_OUT` | server | CGI / connection timeout in milliseconds |
+| `TIME_OUT` | server | Connection timeout in milliseconds |
+| `CGI_TIME_OUT` | server | CGI process timeout in milliseconds |
 | `LOCATION` | server | Define a route |
 | `INDEX` | location | Default file to serve |
 | `PERMISSIONS` | location | Allowed methods (`get`, `post`, `delete`) |
